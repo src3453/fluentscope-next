@@ -7,6 +7,24 @@ FluentScope Next is a real-time audio oscilloscope and spectrum analyzer for aud
 - **Lissajous** plots audio in X/Y mode for inspecting stereo phase relationships.
 - **CRT rendering** adds a beam with adjustable focus, persistence, and bloom to the Scope and Lissajous views.
 
+## Screenshots
+
+### Scope with CRT rendering
+
+![Blue CRT waveform with the Ice theme and stereo level meters](docs/screenshots/scope-crt.png)
+
+### Lissajous view
+
+![Green X/Y trace with the Phosphor theme](docs/screenshots/lissajous.png)
+
+### Controls menu
+
+![F1 controls menu over the Scope view with the spectrum overlay enabled](docs/screenshots/controls-menu.png)
+
+### Spectrum and waterfall
+
+![Frequency spectrum above a scrolling waterfall with the Viridis theme](docs/screenshots/spectrum-waterfall.png)
+
 ## Install and run
 
 The commands below use Python 3.12 and Windows PowerShell.
