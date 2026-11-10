@@ -59,11 +59,14 @@ To enable CRT rendering, install ModernGL and use a graphics driver with OpenGL 
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
 | R / M | Cycle the trigger or stereo mode |
+| X / Shift+X | Cycle the Scope time span forward or backward |
 | A / H | Cycle scope gain control or toggle gain peak hold |
 | J / K / D | Toggle the scope grid, fixed-gain dBFS labels, or AGC dBFS labels |
 | L / W / I | Cycle the X/Y mode, swap axes, or change axis inversion |
 | C | Toggle the CRT beam when OpenGL rendering is available |
 | T / Shift+T | Cycle themes forward or backward |
+
+The **Time span** control in the F1 menu selects how much audio the Scope shows across its horizontal axis. At 48 kHz the options are 5.33, 10.67, 21.33 (default), 42.67, and 85.33 ms.
 
 Settings are saved to `fluentscope_settings.json` beside the script.
 

@@ -18,7 +18,8 @@ CHANNELS = 2 # 2 = stereo; falls back to mono if the device has only one input c
 FORMAT = pyaudio.paInt16
 CHUNK = 512
 
-BUFFER_SIZE = 2 ** 11
+SCOPE_SAMPLE_COUNTS = (256, 512, 1024, 2048, 4096)
+DEFAULT_SCOPE_SAMPLES = 1024
 
 # ==========================
 # Spectrum Settings
@@ -103,8 +104,8 @@ DIFF_SQUARED = False          # False: sum of |a-b| (SAD), True: sum of (a-b)^2 
 # bias toward newer positions, in units of normalized difference (1.0 = reference's own size)
 DIFF_POSITION_WEIGHT = 0.07
 
-# the FFT trigger looks back up to 3x the display length
-RING_SIZE = max(BUFFER_SIZE * 2, FFT_SIZE)
+# The FFT trigger needs up to 3x the largest Scope time span.
+RING_SIZE = max(3 * SCOPE_SAMPLE_COUNTS[-1], FFT_SIZE)
 
 # ==========================
 # Stereo Settings
@@ -134,6 +135,7 @@ LISSAJOUS_INVERTS = ["Off", "X", "Y", "XY"] # [I] flip the polarity of an axis
 LISSAJOUS_INVERT = "Off"
 
 LISSAJOUS_POINTS = 2048           # newest samples drawn per frame
+LISSAJOUS_HISTORY = 4096          # maximum history for the continuous CRT trace
 LISSAJOUS_AUTOCORR_DELAY = 90     # samples; Bespoke's autocorrelationDelay
 LISSAJOUS_DELAY_MIN = 1
 LISSAJOUS_DELAY_MAX = 1024
@@ -382,7 +384,7 @@ def peak_trigger_range(waveform: np.ndarray):
 def fft_trigger_range(samples: np.ndarray, display_len: int):
     """
     Pitch-locked trigger after Furnace's chanOsc (src/gui/chanOsc.cpp):
-      1. FFT of the windowed signal (last 2 * display_len samples)
+      1. FFT of the windowed signal (at least 2 * display_len samples)
       2. inverse FFT of the power spectrum = auto-correlation
       3. period = highest auto-correlation peak after its lowest point
       4. DFT of the fundamental over ONE period
@@ -391,12 +393,14 @@ def fft_trigger_range(samples: np.ndarray, display_len: int):
     Returns (start index into `samples`, period_in_samples or None).
     """
 
-    n = display_len * 2
+    # Keep the default pitch analysis range when zooming in on the waveform.
+    analysis_len = max(display_len, DEFAULT_SCOPE_SAMPLES)
+    n = analysis_len * 2
     end = len(samples)
 
     free_run = end - display_len
 
-    if end < display_len * 3:
+    if end < analysis_len * 3:
         return free_run, None
 
     segment = samples[end - n:].astype(np.float64)
@@ -446,7 +450,7 @@ def fft_trigger_range(samples: np.ndarray, display_len: int):
         if denominator < 0.0:
             wave_len += 0.5 * (a - c) / denominator
 
-    if wave_len < 2.0 or wave_len > display_len:
+    if wave_len < 2.0 or wave_len > analysis_len:
         return free_run, None
 
     #
@@ -577,9 +581,8 @@ class HybridTrigger:
     def __init__(self):
         self.rel_phase = None # remembered in-period position (0..1)
 
-    def find(self, samples: np.ndarray):
-        display_len = BUFFER_SIZE // 2
-        offset = len(samples) - BUFFER_SIZE
+    def find(self, samples: np.ndarray, display_len: int):
+        offset = len(samples) - 2 * display_len
         waveform = samples[offset:]
 
         candidates, half = peak_trigger_candidates(waveform)
@@ -969,7 +972,7 @@ diff_triggers = {}
 def find_trigger(samples: np.ndarray, mode: str, key: str = "mix", end_abs=None):
     """Returns (start, end, period_in_samples or None) into `samples`."""
 
-    display_len = BUFFER_SIZE // 2
+    display_len = scope_samples
 
     if mode == "Off":
         # free-run: always the newest samples, no alignment
@@ -999,9 +1002,9 @@ def find_trigger(samples: np.ndarray, mode: str, key: str = "mix", end_abs=None)
         return start, start + display_len, wave_len
 
     if mode == "Hybrid":
-        return hybrid_triggers.setdefault(key, HybridTrigger()).find(samples)
+        return hybrid_triggers.setdefault(key, HybridTrigger()).find(samples, display_len)
 
-    offset = len(samples) - BUFFER_SIZE
+    offset = len(samples) - 2 * display_len
     start, end = peak_trigger_range(samples[offset:])
     return offset + start, offset + end, None
 
@@ -1487,6 +1490,7 @@ view = VIEW_SCOPE
 show_overlay = True
 show_scope_graticule = True
 show_scope_dbfs_scale = True
+scope_samples = DEFAULT_SCOPE_SAMPLES
 scope_agc_mode = "Off"
 show_scope_agc_dbfs_scale = False
 scope_agc_peak_hold = False
@@ -1564,7 +1568,7 @@ def apply_settings(data):
     """Apply saved values, ignoring anything missing or invalid."""
     global view, show_overlay, trigger_mode, stereo_mode, lissajous_mode, lissajous_delay
     global lissajous_swap, lissajous_invert
-    global show_scope_graticule, show_scope_dbfs_scale
+    global show_scope_graticule, show_scope_dbfs_scale, scope_samples
     global scope_agc_mode, show_scope_agc_dbfs_scale, scope_agc_peak_hold
     global crt_enabled, crt_beam_width, crt_persistence, crt_exposure, crt_gamma, crt_bloom
 
@@ -1582,6 +1586,9 @@ def apply_settings(data):
         show_scope_graticule = data["show_scope_graticule"]
     if isinstance(data.get("show_scope_dbfs_scale"), bool):
         show_scope_dbfs_scale = data["show_scope_dbfs_scale"]
+    samples = data.get("scope_samples")
+    if type(samples) is int and samples in SCOPE_SAMPLE_COUNTS:
+        scope_samples = samples
     if data.get("scope_agc_mode") in SCOPE_AGC_MODES:
         scope_agc_mode = data["scope_agc_mode"]
     elif data.get("scope_agc") is True:
@@ -1634,6 +1641,7 @@ def current_settings():
         "show_overlay": show_overlay,
         "show_scope_graticule": show_scope_graticule,
         "show_scope_dbfs_scale": show_scope_dbfs_scale,
+        "scope_samples": scope_samples,
         "scope_agc_mode": scope_agc_mode,
         "show_scope_agc_dbfs_scale": show_scope_agc_dbfs_scale,
         "scope_agc_peak_hold": scope_agc_peak_hold,
@@ -1954,7 +1962,7 @@ def beam_lissajous(left, right, mix, end_abs):
     delay = lissajous_delay if auto else 0
     margin = CRT_UPSAMPLE_MARGIN if CRT_UPSAMPLE > 1 else 0
 
-    available = len(mix) - delay - margin - 1
+    available = min(len(mix), LISSAJOUS_HISTORY) - delay - margin - 1
     new = available if lissajous_beam_end is None else end_abs - lissajous_beam_end
     new = int(min(max(new, 0), available))
     lissajous_beam_end = end_abs
@@ -2002,7 +2010,8 @@ def render_gl(traces, left, right, mix, end_abs):
         return
 
     scene = (view, stereo_mode, theme_index, effective_lissajous_mode(), lissajous_swap,
-             lissajous_invert, view == VIEW_SCOPE and scope_agc_mode != "Off")
+             lissajous_invert, view == VIEW_SCOPE and scope_agc_mode != "Off",
+             scope_samples if view == VIEW_SCOPE else None)
     if scene != crt_scene:
         r.clear()
         crt_scene = scene
@@ -2057,6 +2066,10 @@ def scale_controls():
     )
 
 
+def scope_time_span():
+    return f"{scope_samples * 1000 / RATE:.2f} ms"
+
+
 def menu_items():
     agc = scope_agc_mode
     hold = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "Off"
@@ -2069,6 +2082,7 @@ def menu_items():
             (pygame.K_m, "M", f"Stereo: {stereo_mode}"),
         )),
         ("Scope", (
+            (pygame.K_x, "X", f"Time span: {scope_time_span()}"),
             (pygame.K_a, "A", f"AGC: {agc}"),
             (pygame.K_h, "H", f"AGC peak hold: {hold}"),
             *((key, shortcut, f"{name}: {'On' if enabled else 'Off'}")
@@ -2140,6 +2154,7 @@ print(r"""     ______              __  ____
 print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
 print("        [F1] Menu  [A] Scope AGC Off/High/Med/Low  [D] AGC dBFS labels  [H] AGC peak hold")
 print("        [J] Scope grid  [K] Fixed-gain dBFS labels")
+print("        [X]/[Shift+X] Scope time span")
 print("        [W] Lissajous swap X/Y  [I] invert Off/X/Y/XY (+Shift: back)")
 print("        [L] Lissajous L/R <-> Auto  [,] [.] (or [ and ]) autocorrelation delay -1 / +1 (+Shift: x0.5 / x2)")
 if gl_renderer is not None:
@@ -2217,6 +2232,12 @@ while running:
                 stereo_mode = cycle(STEREO_MODES, stereo_mode)
                 scope_gain = SCOPE_GAIN
                 scope_held_peak, scope_hold_remaining = 0.0, 0.0
+            elif event.key == pygame.K_x:
+                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
+                index = SCOPE_SAMPLE_COUNTS.index(scope_samples) + step
+                scope_samples = SCOPE_SAMPLE_COUNTS[index % len(SCOPE_SAMPLE_COUNTS)]
+                for triggers in (hybrid_triggers, corr_triggers, legacy_triggers, diff_triggers):
+                    triggers.clear()
             elif event.key == pygame.K_a:
                 scope_agc_mode = cycle(SCOPE_AGC_MODES, scope_agc_mode)
                 if scope_agc_mode == "Off":
@@ -2318,7 +2339,7 @@ while running:
     #
 
     info = font.render(
-        f"Rate:{RATE}Hz   Buffer:{BUFFER_SIZE}   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}",
+        f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}",
         True,
         theme["text"]
     )
@@ -2344,6 +2365,8 @@ while running:
         )
     else:
         help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
+        if view == VIEW_SCOPE:
+            help_text += f"   Time span: {scope_time_span()}"
 
     keys_help = small_font.render(help_text, True, theme["text"])
 
