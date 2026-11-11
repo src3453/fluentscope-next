@@ -156,7 +156,8 @@ LISSAJOUS_TOP = 64                # leaves room for the info text
 # Level Meter Settings
 # ==========================
 
-SHOW_LEVEL_METER = True # L/R meter on the right edge (reserves METER_PANEL_WIDTH pixels)
+SHOW_LEVEL_METER = True # L/R meter on the right edge (reserves METER_PANEL_WIDTH pixels), [F2] toggles
+SHOW_HUD = True # status text + menu button, [F3] toggles ([F1] opens the menu even when hidden)
 METER_PANEL_WIDTH = 70
 
 METER_DB_MIN = -60.0
@@ -186,7 +187,7 @@ SCOPE_AGC_HOLD_TIME = 0.5 # seconds
 FPS = 180 # no effect when VSYNC is enabled
 VSYNC = False # if True, the display is synchronized with the monitor's refresh rate, otherwise it runs at a fixed FPS
 
-LINE_IS_STEP = True # if True, the waveform is drawn as a step line, otherwise as a smooth line
+LINE_IS_STEP = True # start with step lines ([P] toggles; smooth = straight lines between samples)
 
 SPEC_OVERLAY_RATIO = 0.4 # height ratio of the spectrum overlay on the scope view
 
@@ -1465,8 +1466,11 @@ gl_window = open_gl_window() if USE_OPENGL else None
 
 if gl_window is not None:
     screen, gl_renderer = gl_window
+    # text, labels and the menu: composited above the GL lines and the CRT beam
+    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
 else:
     screen = pygame.display.set_mode((WIDTH, HEIGHT), vsync=1 if VSYNC else 0)
+    overlay = screen # pygame draws everything in order: text is drawn last anyway
 
 pygame.display.set_caption("FluentScope Next")
 
@@ -1505,6 +1509,7 @@ theme = THEMES[theme_index]
 trace_renderer = TRACE_RENDERER if gl_renderer is not None else "Pygame"
 line_width = LINE_WIDTH
 line_aa = LINE_AA
+line_is_step = LINE_IS_STEP
 spectrum_lines = [] # spectrum lines for the OpenGL line renderer, refilled every frame
 
 
@@ -1524,18 +1529,52 @@ crt_bloom = CRT_BLOOM
 crt_scene = None         # (view, stereo, theme, ...) - the phosphor is erased when it changes
 lissajous_beam_end = None # absolute sample index the Lissajous beam has been drawn up to
 
-# plot area = window minus the level meter panel on the right
-PLOT_WIDTH = WIDTH - (METER_PANEL_WIDTH if SHOW_LEVEL_METER else 0)
-
-analyzer = SpectrumAnalyzer(
-    FFT_SIZE, RATE, PLOT_WIDTH,
-    SPEC_F_MIN, SPEC_F_MAX,
-    SPEC_DB_MIN, SPEC_DB_MAX,
-)
+show_level_meter = SHOW_LEVEL_METER
+show_hud = SHOW_HUD # status text + menu button ([F1] opens the menu either way)
 
 SPLIT_Y = HEIGHT // 2
-waterfall = Waterfall(PLOT_WIDTH, HEIGHT - SPLIT_Y)
-waterfall.rerender(theme["lut"])
+PLOT_WIDTH = None
+analyzer = None
+waterfall = None
+MENU_BUTTON = MENU_PANEL = None
+
+
+def layout_menu():
+    global MENU_BUTTON, MENU_PANEL
+    MENU_BUTTON = pygame.Rect(PLOT_WIDTH - 122, 6, 112, 24)
+    # the panel sits under the button, or at the top when the button is hidden
+    MENU_PANEL = pygame.Rect(PLOT_WIDTH - 894, 36 if show_hud else 6, 884, 232)
+
+
+def set_plot_width():
+    """
+    Plot area = window minus the level meter panel on the right. Rebuilds everything
+    sized to it; the waterfall history is resampled so it survives a meter toggle.
+    """
+    global PLOT_WIDTH, analyzer, waterfall, crt_scene
+    width = WIDTH - (METER_PANEL_WIDTH if show_level_meter else 0)
+    if width == PLOT_WIDTH:
+        return
+    PLOT_WIDTH = width
+    analyzer = SpectrumAnalyzer(
+        FFT_SIZE, RATE, PLOT_WIDTH,
+        SPEC_F_MIN, SPEC_F_MAX,
+        SPEC_DB_MIN, SPEC_DB_MAX,
+    )
+    old = waterfall
+    waterfall = Waterfall(PLOT_WIDTH, HEIGHT - SPLIT_Y)
+    if old is not None:
+        # columns are log-frequency positions, so a nearest-column resample keeps them aligned
+        columns = np.minimum((np.arange(PLOT_WIDTH) * old.width) // PLOT_WIDTH, old.width - 1)
+        waterfall.history[:] = old.history[:, columns]
+        waterfall.head = old.head
+        waterfall.pending_rows = old.pending_rows
+    waterfall.rerender(theme["lut"])
+    crt_scene = None # the phosphor was drawn for the old width
+    layout_menu()
+
+
+set_plot_width()
 
 meter = LevelMeter(2)
 
@@ -1578,8 +1617,9 @@ def apply_settings(data):
     global lissajous_swap, lissajous_invert
     global show_scope_graticule, show_scope_dbfs_scale, scope_samples
     global scope_agc_mode, show_scope_agc_dbfs_scale, scope_agc_peak_hold
-    global trace_renderer, line_width, line_aa
+    global trace_renderer, line_width, line_aa, line_is_step
     global crt_beam_width, crt_persistence, crt_exposure, crt_gamma, crt_bloom
+    global show_level_meter, show_hud
 
     def number(key, lo, hi):
         value = data.get(key)
@@ -1591,6 +1631,12 @@ def apply_settings(data):
         view = VIEW_NAMES.index(data["view"])
     if isinstance(data.get("show_overlay"), bool):
         show_overlay = data["show_overlay"]
+    if isinstance(data.get("line_is_step"), bool):
+        line_is_step = data["line_is_step"]
+    if isinstance(data.get("show_level_meter"), bool):
+        show_level_meter = data["show_level_meter"]
+    if isinstance(data.get("show_hud"), bool):
+        show_hud = data["show_hud"]
     if isinstance(data.get("show_scope_graticule"), bool):
         show_scope_graticule = data["show_scope_graticule"]
     if isinstance(data.get("show_scope_dbfs_scale"), bool):
@@ -1655,7 +1701,10 @@ def current_settings():
     data.update({
         "view": VIEW_NAMES[view],
         "show_overlay": show_overlay,
+        "show_level_meter": show_level_meter,
+        "show_hud": show_hud,
         "show_scope_graticule": show_scope_graticule,
+        "line_is_step": line_is_step,
         "show_scope_dbfs_scale": show_scope_dbfs_scale,
         "scope_samples": scope_samples,
         "scope_agc_mode": scope_agc_mode,
@@ -1700,6 +1749,8 @@ def save_settings_if_changed():
 
 
 apply_settings(saved_settings)
+set_plot_width() # the saved meter visibility may change the plot width
+layout_menu()
 
 
 def draw_trace(waveform, color, top, height):
@@ -1708,7 +1759,7 @@ def draw_trace(waveform, color, top, height):
         PLOT_WIDTH,
         height,
         scope_gain,
-        LINE_IS_STEP,
+        line_is_step,
         top,
     )
 
@@ -1794,7 +1845,7 @@ def draw_scope(traces):
 
     if show_overlay:
         draw_spectrum(screen, analyzer, theme, overlay_top, overlay_height, False, gl_line_queue())
-        draw_spectrum_labels(screen, analyzer, theme, small_font, overlay_top, overlay_height, False)
+        draw_spectrum_labels(overlay, analyzer, theme, small_font, overlay_top, overlay_height, False)
 
     show_dbfs_scale = show_scope_dbfs_scale if scope_agc_mode == "Off" else show_scope_agc_dbfs_scale
     if show_dbfs_scale:
@@ -1813,13 +1864,13 @@ def draw_scope(traces):
                 pos = (PLOT_WIDTH - label.get_width() - 8, i * SPLIT_Y + (8 if i else 64))
             else:
                 pos = (PLOT_WIDTH - 24 * (2 - i) - 4, 64)
-            screen.blit(label, pos)
+            overlay.blit(label, pos)
 
 
 def draw_spectrum_view():
     draw_spectrum_grid(screen, analyzer, theme, 0, SPLIT_Y)
     draw_spectrum(screen, analyzer, theme, 0, SPLIT_Y, True, gl_line_queue())
-    draw_spectrum_labels(screen, analyzer, theme, small_font, 0, SPLIT_Y, True)
+    draw_spectrum_labels(overlay, analyzer, theme, small_font, 0, SPLIT_Y, True)
 
     screen.blit(waterfall.surface, (0, SPLIT_Y))
     pygame.draw.line(screen, theme["center"], (0, SPLIT_Y), (PLOT_WIDTH, SPLIT_Y), 2)
@@ -1907,8 +1958,8 @@ def draw_lissajous(points):
         y_name = "-" + y_name
     x_label = small_font.render(x_name, True, x_color)
     y_label = small_font.render(y_name, True, y_color)
-    screen.blit(x_label, (right - x_label.get_width() - 4, mid_y + 4))
-    screen.blit(y_label, (mid_x + 6, rect_top + 4))
+    overlay.blit(x_label, (right - x_label.get_width() - 4, mid_y + 4))
+    overlay.blit(y_label, (mid_x + 6, rect_top + 4))
 
 
 def build_traces(left, right, mix, end_abs):
@@ -2019,9 +2070,17 @@ def beam_lissajous(left, right, mix, end_abs):
 
 def line_scope(traces):
     for waveform, color, top, height in traces:
-        points = build_waveform_points(
-            waveform, PLOT_WIDTH, height, scope_gain, LINE_IS_STEP, top, round_pixels=False,
-        )
+        if line_is_step:
+            points = build_waveform_points(
+                waveform, PLOT_WIDTH, height, scope_gain, True, top, round_pixels=False,
+            )
+        elif len(waveform) > 1:
+            # every sample at its subpixel position (no decimation), so the
+            # anti-aliasing follows the real slope of the signal
+            x = np.linspace(0, PLOT_WIDTH - 1, len(waveform), dtype=np.float32)
+            points = np.column_stack((x, waveform_y(waveform, top, height, scope_gain)))
+        else:
+            points = None
         if points is not None:
             gl_renderer.draw_line(points, color01(color), scissor=(0, top, PLOT_WIDTH, height))
 
@@ -2039,7 +2098,7 @@ def render_gl(traces, left, right, mix, end_abs):
 
     r = gl_renderer
     r.upload_ui(screen)
-    ui_rect = tuple(MENU_PANEL) if menu_open else None
+    r.upload_overlay(overlay)
     trace_view = view in (VIEW_SCOPE, VIEW_LISSAJOUS)
 
     # plain line layer: spectrum, then the GL Line traces on top
@@ -2088,7 +2147,7 @@ def render_gl(traces, left, right, mix, end_abs):
         beam_scope(traces)
     else:
         beam_lissajous(left, right, mix, end_abs)
-    r.present(True, ui_rect=ui_rect)
+    r.present(True)
 
 
 def step_option(options, current, step):
@@ -2110,10 +2169,6 @@ def format_line_width(value):
 
 def cycle(options, current):
     return options[(options.index(current) + 1) % len(options)]
-
-
-MENU_BUTTON = pygame.Rect(PLOT_WIDTH - 122, 6, 112, 24)
-MENU_PANEL = pygame.Rect(PLOT_WIDTH - 894, 36, 884, 232)
 
 
 def scale_controls():
@@ -2138,9 +2193,12 @@ def menu_items():
             (pygame.K_s, "S", f"Spectrum overlay: {'On' if show_overlay else 'Off'}"),
             (pygame.K_r, "R", f"Trigger: {trigger_mode}"),
             (pygame.K_m, "M", f"Stereo: {stereo_mode}"),
+            (pygame.K_F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
+            (pygame.K_F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
         )),
         ("Scope", (
             (pygame.K_x, "X", f"Time span: {scope_time_span()}"),
+            (pygame.K_p, "P", f"Line: {'Step' if line_is_step else 'Smooth'}"),
             (pygame.K_a, "A", f"AGC: {agc}"),
             (pygame.K_h, "H", f"AGC peak hold: {hold}"),
             *((key, shortcut, f"{name}: {'On' if enabled else 'Off'}")
@@ -2178,31 +2236,32 @@ def menu_row(column, row):
 
 
 def draw_button(rect, text):
-    pygame.draw.rect(screen, theme["bg"], rect)
-    pygame.draw.rect(screen, theme["center"], rect, 1)
+    pygame.draw.rect(overlay, theme["bg"], rect)
+    pygame.draw.rect(overlay, theme["center"], rect, 1)
     label = small_font.render(text, True, theme["text"])
-    screen.blit(label, label.get_rect(center=rect.center))
+    overlay.blit(label, label.get_rect(center=rect.center))
 
 
 def draw_menu():
-    draw_button(MENU_BUTTON, "Close [F1]" if menu_open else "Menu [F1]")
+    if show_hud:
+        draw_button(MENU_BUTTON, "Close [F1]" if menu_open else "Menu [F1]")
     if not menu_open:
         return
 
-    pygame.draw.rect(screen, theme["bg"], MENU_PANEL)
-    pygame.draw.rect(screen, theme["center"], MENU_PANEL, 1)
+    pygame.draw.rect(overlay, theme["bg"], MENU_PANEL)
+    pygame.draw.rect(overlay, theme["center"], MENU_PANEL, 1)
     pointer = pygame.mouse.get_pos()
     for column, (title, items) in enumerate(menu_items()):
         x = menu_row(column, 0).x
-        screen.blit(font.render(title, True, theme["text"]), (x + 4, MENU_PANEL.y + 7))
+        overlay.blit(font.render(title, True, theme["text"]), (x + 4, MENU_PANEL.y + 7))
         for row, (_, shortcut, text) in enumerate(items):
             rect = menu_row(column, row)
             if rect.collidepoint(pointer):
-                pygame.draw.rect(screen, theme["grid"], rect)
+                pygame.draw.rect(overlay, theme["grid"], rect)
             label = small_font.render(f"[{shortcut}] {text}", True, theme["text"])
-            screen.blit(label, (rect.x + 4, rect.y + 2))
+            overlay.blit(label, (rect.x + 4, rect.y + 2))
     hint = "Shift reverses supported controls or changes XY delay by x2 / x0.5."
-    screen.blit(small_font.render(hint, True, theme["text"]), (MENU_PANEL.x + 14, MENU_PANEL.bottom - 22))
+    overlay.blit(small_font.render(hint, True, theme["text"]), (MENU_PANEL.x + 14, MENU_PANEL.bottom - 22))
 
 
 # ==========================
@@ -2217,9 +2276,10 @@ print(r"""     ______              __  ____
   ~ Completely Rewritten ~
   (c) 2026 src3453 Released under The MIT License.""")
 print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
-print("        [F1] Menu  [A] Scope AGC Off/High/Med/Low  [D] AGC dBFS labels  [H] AGC peak hold")
+print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button")
+print("        [A] Scope AGC Off/High/Med/Low  [D] AGC dBFS labels  [H] AGC peak hold")
 print("        [J] Scope grid  [K] Fixed-gain dBFS labels")
-print("        [X]/[Shift+X] Scope time span")
+print("        [X]/[Shift+X] Scope time span  [P] Scope step / smooth line")
 print("        [W] Lissajous swap X/Y  [I] invert Off/X/Y/XY (+Shift: back)")
 print("        [L] Lissajous L/R <-> Auto  [,] [.] (or [ and ]) autocorrelation delay -1 / +1 (+Shift: x0.5 / x2)")
 if gl_renderer is not None:
@@ -2243,7 +2303,7 @@ while running:
             focus_window()
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if MENU_BUTTON.collidepoint(event.pos):
+            if show_hud and MENU_BUTTON.collidepoint(event.pos):
                 menu_open = not menu_open
                 continue
             if menu_open:
@@ -2269,6 +2329,12 @@ while running:
             elif event.key == pygame.K_ESCAPE and menu_open:
                 menu_open = False
                 continue
+            elif event.key == pygame.K_F2:
+                show_level_meter = not show_level_meter
+                set_plot_width()
+            elif event.key == pygame.K_F3:
+                show_hud = not show_hud
+                layout_menu()
             elif event.key == pygame.K_TAB:
                 view = (view + 1) % len(VIEW_NAMES)
             elif event.key == pygame.K_1:
@@ -2323,6 +2389,8 @@ while running:
                 show_scope_graticule = not show_scope_graticule
             elif event.key == pygame.K_k:
                 show_scope_dbfs_scale = not show_scope_dbfs_scale
+            elif event.key == pygame.K_p:
+                line_is_step = not line_is_step
             elif event.key == pygame.K_h:
                 scope_agc_peak_hold = not scope_agc_peak_hold
                 scope_held_peak, scope_hold_remaining = 0.0, 0.0
@@ -2387,6 +2455,8 @@ while running:
     #
 
     screen.fill(theme["bg"])
+    if overlay is not screen:
+        overlay.fill((0, 0, 0, 0))
 
     if view == VIEW_SCOPE and scope_agc_mode != "Off":
         peak = max(float(np.max(np.abs(waveform), initial=0.0)) for waveform, _, _, _ in traces)
@@ -2407,7 +2477,7 @@ while running:
     else:
         draw_spectrum_view()
 
-    if SHOW_LEVEL_METER:
+    if show_level_meter:
         draw_level_meter(
             screen, meter, theme, small_font,
             PLOT_WIDTH, 10, METER_PANEL_WIDTH, HEIGHT - 20,
@@ -2418,67 +2488,71 @@ while running:
     # Text
     #
 
-    info = font.render(
-        f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}",
-        True,
-        theme["text"]
-    )
-
-    screen.blit(info, (10, 10))
-
-    if trigger_mode in ("FFT", "Hybrid", "Corr"):
-        trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
-    else:
-        trigger_info = trigger_mode
-
-    stereo_info = stereo_mode if input_channels >= 2 else f"{stereo_mode} (mono in)"
-
-    if view == VIEW_LISSAJOUS:
-        if effective_lissajous_mode() == "Auto":
-            mono = " (mono in)" if input_channels == 1 else ""
-            liss_info = f"Auto{mono}   Delay:{lissajous_delay} ({lissajous_delay / RATE * 1000:.2f}ms)"
-        else:
-            liss_info = "L/R"
-        help_text = (
-            f"View:{VIEW_NAMES[view]}   Theme:{theme['name']}   Lissajous:{liss_info}"
-            f"   Swap:{'ON' if lissajous_swap else 'OFF'}   Invert:{lissajous_invert}"
+    if show_hud:
+        info = font.render(
+            f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}",
+            True,
+            theme["text"]
         )
-    else:
-        help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
+
+        overlay.blit(info, (10, 10))
+
+        if trigger_mode in ("FFT", "Hybrid", "Corr"):
+            trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
+        else:
+            trigger_info = trigger_mode
+
+        stereo_info = stereo_mode if input_channels >= 2 else f"{stereo_mode} (mono in)"
+
+        if view == VIEW_LISSAJOUS:
+            if effective_lissajous_mode() == "Auto":
+                mono = " (mono in)" if input_channels == 1 else ""
+                liss_info = f"Auto{mono}   Delay:{lissajous_delay} ({lissajous_delay / RATE * 1000:.2f}ms)"
+            else:
+                liss_info = "L/R"
+            help_text = (
+                f"View:{VIEW_NAMES[view]}   Theme:{theme['name']}   Lissajous:{liss_info}"
+                f"   Swap:{'ON' if lissajous_swap else 'OFF'}   Invert:{lissajous_invert}"
+            )
+        else:
+            help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
+            if view == VIEW_SCOPE:
+                help_text += f"   Time span: {scope_time_span()}"
+
+        keys_help = small_font.render(help_text, True, theme["text"])
+
+        overlay.blit(keys_help, (10, 32))
+
         if view == VIEW_SCOPE:
-            help_text += f"   Time span: {scope_time_span()}"
-
-    keys_help = small_font.render(help_text, True, theme["text"])
-
-    screen.blit(keys_help, (10, 32))
-
-    if view == VIEW_SCOPE:
-        agc_status = scope_agc_mode
-        if scope_agc_mode != "Off":
-            agc_status += f" x{scope_gain / SCOPE_GAIN:.2f}"
-        hold_status = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "OFF"
-        scale_status = "   ".join(
-            f"{name}:{'On' if enabled else 'Off'}" for _, _, name, enabled in scale_controls()
-        )
-        agc_text = f"AGC:{agc_status}   Peak hold:{hold_status}   {scale_status}"
-        screen.blit(small_font.render(agc_text, True, theme["text"]), (10, 62))
-
-    if gl_renderer is not None:
-        if trace_renderer == "CRT":
-            renderer_text = (
-                f"Renderer:CRT   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
-                f"   Afterglow:{format_seconds(crt_persistence)}   Bloom:{'ON' if crt_bloom else 'OFF'}"
-                f"   Gamma:{crt_gamma:.1f}{' (ink: 1.0)' if theme_is_light() else ''}"
-                f"   Line:{format_line_width(line_width)} AA:{'ON' if line_aa else 'OFF'}"
+            agc_status = scope_agc_mode
+            if scope_agc_mode != "Off":
+                agc_status += f" x{scope_gain / SCOPE_GAIN:.2f}"
+            hold_status = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "OFF"
+            scale_status = "   ".join(
+                f"{name}:{'On' if enabled else 'Off'}" for _, _, name, enabled in scale_controls()
             )
-        elif trace_renderer == "GL Line":
-            renderer_text = (
-                f"Renderer:GL Line   Width:{format_line_width(line_width)}"
-                f"   AA:{'ON' if line_aa else 'OFF'}"
+            agc_text = (
+                f"AGC:{agc_status}   Peak hold:{hold_status}   {scale_status}"
+                f"   Line:{'Step' if line_is_step else 'Smooth'}"
             )
-        else:
-            renderer_text = "Renderer:Pygame"
-        screen.blit(small_font.render(renderer_text, True, theme["text"]), (10, 47))
+            overlay.blit(small_font.render(agc_text, True, theme["text"]), (10, 62))
+
+        if gl_renderer is not None:
+            if trace_renderer == "CRT":
+                renderer_text = (
+                    f"Renderer:CRT   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
+                    f"   Afterglow:{format_seconds(crt_persistence)}   Bloom:{'ON' if crt_bloom else 'OFF'}"
+                    f"   Gamma:{crt_gamma:.1f}{' (ink: 1.0)' if theme_is_light() else ''}"
+                    f"   Line:{format_line_width(line_width)} AA:{'ON' if line_aa else 'OFF'}"
+                )
+            elif trace_renderer == "GL Line":
+                renderer_text = (
+                    f"Renderer:GL Line   Width:{format_line_width(line_width)}"
+                    f"   AA:{'ON' if line_aa else 'OFF'}"
+                )
+            else:
+                renderer_text = "Renderer:Pygame"
+            overlay.blit(small_font.render(renderer_text, True, theme["text"]), (10, 47))
 
     draw_menu()
     if gl_renderer is not None:

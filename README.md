@@ -86,11 +86,14 @@ Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygam
 
 | Key | Action |
 | --- | --- |
-| F1 | Open the controls menu |
+| F1 | Open the controls menu (works even when the menu button is hidden) |
+| F2 | Show or hide the level meter |
+| F3 | Show or hide the status text and menu button |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
 | R / M | Cycle the trigger or stereo mode |
 | X / Shift+X | Cycle the Scope time span forward or backward |
+| P | Toggle step or smooth Scope lines (Pygame and GL Line renderers) |
 | A / H | Cycle scope gain control or toggle gain peak hold |
 | J / K / D | Toggle the scope grid, fixed-gain dBFS labels, or AGC dBFS labels |
 | L / W / I | Cycle the X/Y mode, swap axes, or change axis inversion |

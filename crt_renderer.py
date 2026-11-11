@@ -180,8 +180,10 @@ uniform sampler2D uHDR;    // accumulated beam light
 uniform sampler2D uBloomNear;
 uniform sampler2D uBloomFar;
 uniform sampler2D uLines;  // premultiplied plain line layer
+uniform sampler2D uOverlay; // pygame SRCALPHA surface (text, menu) on top of everything
 uniform int uCRT;
 uniform int uLineLayer;
+uniform int uUseOverlay;
 uniform vec4 uUIRect; // left, top, right, bottom in UI pixels
 uniform int uInk;          // light background: the beam darkens like ink
 uniform float uExposure;
@@ -203,22 +205,31 @@ float gamma_saturate(float L, out float v) {
     return v / pow(1.0 + pow(v, uKnee), 1.0 / uKnee);
 }
 
+vec3 base_color(vec2 uiUV);
+
 void main() {
     vec2 uiUV = vec2(vUV.x, 1.0 - vUV.y);
+    vec3 color = base_color(uiUV);
+    if (uUseOverlay == 1) {
+        vec4 top = texture(uOverlay, uiUV);
+        color = mix(color, top.rgb, top.a);
+    }
+    fragColor = vec4(color, 1.0);
+}
+
+vec3 base_color(vec2 uiUV) {
     vec3 ui = texture(uUI, uiUV).rgb;
     vec2 uiPixel = uiUV * vec2(textureSize(uUI, 0));
 
     if (all(greaterThanEqual(uiPixel, uUIRect.xy)) && all(lessThan(uiPixel, uUIRect.zw))) {
-        fragColor = vec4(ui, 1.0); // menu panel: on top of everything
-        return;
+        return ui; // no beam / lines inside this rectangle
     }
     if (uLineLayer == 1) {
         vec4 line = texture(uLines, vUV);
         ui = ui * (1.0 - line.a) + line.rgb;
     }
     if (uCRT == 0) {
-        fragColor = vec4(ui, 1.0);
-        return;
+        return ui;
     }
 
     vec3 hdr = texture(uHDR, vUV).rgb
@@ -245,7 +256,7 @@ void main() {
         color *= 1.0 - uVignette * dot(d, d) * 2.0;
     }
 
-    fragColor = vec4(color, 1.0);
+    return color;
 }
 """
 
@@ -362,6 +373,7 @@ class CRTRenderer:
     """
     Usage per frame:
         renderer.upload_ui(surface)
+        renderer.upload_overlay(text_surface)           # optional, drawn on top
         if crt:
             renderer.begin_frame(dt)
             renderer.draw_beam(points, energy, color)   # any number of times
@@ -437,6 +449,9 @@ class CRTRenderer:
 
         self.ui_tex = ctx.texture((width, height), 4)
         self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.overlay_tex = ctx.texture((width, height), 4)
+        self.overlay_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.overlay = False        # upload_overlay() was called this frame
 
         # plain line renderer (non-CRT)
         self.line_width = 2.0       # px
@@ -498,8 +513,7 @@ class CRTRenderer:
 
     # ---------- UI ----------
 
-    def upload_ui(self, surface):
-        """Upload a pygame surface (same size as the window) as the 2D layer."""
+    def _upload(self, tex, surface, alpha):
         import pygame
 
         masks = surface.get_masks()
@@ -507,13 +521,26 @@ class CRTRenderer:
             surface.get_bitsize() == 32
             and surface.get_pitch() == self.width * 4
             and masks[:3] == (0xFF0000, 0x00FF00, 0x0000FF)
+            and (not alpha or masks[3] == 0xFF000000)
         ):
-            # little-endian XRGB in memory = B, G, R, X bytes: no conversion
-            self.ui_tex.swizzle = "BGR1"
-            self.ui_tex.write(surface.get_buffer().raw)
+            # little-endian (A/X)RGB in memory = B, G, R, A/X bytes: no conversion
+            tex.swizzle = "BGRA" if alpha else "BGR1"
+            tex.write(surface.get_buffer().raw)
         else:
-            self.ui_tex.swizzle = "RGBA"
-            self.ui_tex.write(pygame.image.tobytes(surface, "RGBA"))
+            tex.swizzle = "RGBA" if alpha else "RGB1"
+            tex.write(pygame.image.tobytes(surface, "RGBA"))
+
+    def upload_ui(self, surface):
+        """Upload a pygame surface (same size as the window) as the 2D layer."""
+        self._upload(self.ui_tex, surface, alpha=False)
+
+    def upload_overlay(self, surface):
+        """
+        Upload a per-pixel alpha pygame surface (same size as the window) that the
+        next present() lays over everything, the lines and the beam included.
+        """
+        self._upload(self.overlay_tex, surface, alpha=True)
+        self.overlay = True
 
     # ---------- beam ----------
 
@@ -688,6 +715,7 @@ class CRTRenderer:
         self.bloom_levels[0][0][0].use(2)
         self.bloom_levels[1][0][0].use(3)
         self.line_tex.use(4)
+        self.overlay_tex.use(5)
 
         prog = self.comp_prog
         prog["uUI"].value = 0
@@ -698,6 +726,9 @@ class CRTRenderer:
         prog["uCRT"].value = 1 if crt else 0
         prog["uLineLayer"].value = 1 if self.line_layer else 0
         self.line_layer = False
+        prog["uOverlay"].value = 5
+        prog["uUseOverlay"].value = 1 if self.overlay else 0
+        self.overlay = False
         if ui_rect is None:
             prog["uUIRect"].value = (0, 0, 0, 0)
         else:
