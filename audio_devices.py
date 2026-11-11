@@ -1,5 +1,7 @@
 """Audio source discovery and the startup device picker (no capture on import)."""
 
+import sys
+
 
 def capture_devices(pa):
     devices = []
@@ -9,13 +11,20 @@ def capture_devices(pa):
             info['index'] = index
             info['api_name'] = pa.get_host_api_info_by_index(info['hostApi'])['name']
             devices.append(info)
+    if sys.platform == 'darwin':
+        from macos_loopback import system_audio_device
+        devices.append(system_audio_device())
     return devices
 
 
 def resolve_device(pa, devices, selector):
     if selector == '--loopback':
+        native = [d for d in devices if d.get('capture_backend') == 'screencapturekit']
+        if native:
+            return native[0]
         if not hasattr(pa, 'get_default_wasapi_loopback'):
-            raise ValueError('WASAPI loopback requires PyAudioWPatch on Windows.')
+            raise ValueError('Native loopback requires macOS 13+ or PyAudioWPatch on Windows. '
+                             'Otherwise select a monitor/virtual input by name or index.')
         index = int(pa.get_default_wasapi_loopback()['index'])
         matches = [d for d in devices if d['index'] == index]
     else:
@@ -71,6 +80,9 @@ def print_devices(devices):
 def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
                  preferred_channels=2):
     """Use the endpoint's native format for WASAPI loopback, including surround."""
+    if device.get('capture_backend') == 'screencapturekit':
+        from macos_loopback import MacOSLoopbackStream
+        return MacOSLoopbackStream(callback, chunk), dict(channels=2, rate=48000)
     channels = int(device['maxInputChannels'])
     if not device.get('isLoopbackDevice'):
         channels = min(preferred_channels, 2, channels)
@@ -127,7 +139,7 @@ def choose_device(pa, devices, open_device):
         visible = [d for d in devices if bool(d.get('isLoopbackDevice')) == loopback]
         default_index = None
         try:
-            default = (pa.get_default_wasapi_loopback() if loopback else
+            default = (resolve_device(pa, devices, '--loopback') if loopback else
                        pa.get_default_input_device_info())
             default_index = int(default['index'])
         except (AttributeError, OSError, ValueError, LookupError):
@@ -144,9 +156,13 @@ def choose_device(pa, devices, open_device):
             tree.see(selected)
         start.configure(state='normal' if visible else 'disabled')
         status.set('Select an audio source, then click Start.' if visible else
-                   ('No loopback devices. On Windows, install PyAudioWPatch; on other '
-                    'systems, select a monitor/virtual input under Input.' if loopback else
+                   ('No loopback devices. On Windows, install PyAudioWPatch; on Linux, '
+                    'select a monitor/virtual input under Input.' if loopback else
                     'No input devices are available.'))
+        if loopback and any(d.get('capture_backend') == 'screencapturekit' for d in visible):
+            status.set('macOS 13+: captures system audio without a driver. On first use, '
+                       'builds a helper using Apple Command Line Tools. Allow Screen & '
+                       'System Audio Recording in System Settings > Privacy & Security.')
 
     for label in ('Input', 'Output loopback'):
         ttk.Radiobutton(modes, text=label, variable=mode, value=label,

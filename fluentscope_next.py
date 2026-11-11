@@ -1360,7 +1360,7 @@ print(f"Audio source: {device_info['name']} ({input_channels} channels, {RATE} H
 
 
 def open_audio_stream():
-    audio_stream = pa.open(**STREAM_OPEN_KWARGS)
+    audio_stream, _ = prepare_capture(device_info)
     audio_stream.start_stream()
     return audio_stream
 
@@ -1411,6 +1411,9 @@ def open_gl_window():
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+        if sys.platform == 'darwin':
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_FLAGS,
+                                            pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG)
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
         pygame.display.set_mode(
             (WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF, vsync=1 if VSYNC else 0

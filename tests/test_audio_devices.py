@@ -2,7 +2,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from audio_devices import capture_devices, open_capture, print_devices, resolve_device
 
@@ -22,7 +22,8 @@ class AudioDeviceTests(unittest.TestCase):
         self.pa.get_host_api_info_by_index.return_value = dict(name='WASAPI')
 
     def test_discovery_excludes_output_only_endpoints(self):
-        devices = capture_devices(self.pa)
+        with patch('audio_devices.sys.platform', 'win32'):
+            devices = capture_devices(self.pa)
         self.assertEqual([d['name'] for d in devices],
                          ['Microphone', 'Speakers [Loopback]'])
 
