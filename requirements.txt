@@ -1,3 +1,4 @@
 numpy
 pygame
-PyAudio
+PyAudio; sys_platform != "win32"
+PyAudioWPatch; sys_platform == "win32"

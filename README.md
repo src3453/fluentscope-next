@@ -37,13 +37,19 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe fluentscope_next.py
 ```
 
-The last command lists available input devices and exits. Run again with the index of a microphone, line input, or loopback device listed on your system. Replace `0` with your device index.
+Without a device argument, the last command opens a startup menu. Select **Input** for a microphone or line input, or **Output loopback** to capture audio playing through a Windows output device, then click **Start** (or double-click the device). Capture errors are shown in the menu so you can try another device. Cancel or Escape exits.
+
+Windows uses [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI output loopback; no Stereo Mix device or virtual audio cable is required. On other platforms, PyAudio is used; select an OS-provided monitor or virtual input under **Input** for output capture. The startup menu requires Tkinter (included with standard Python on Windows; often packaged as `python3-tk` on Linux).
+
+To update an existing environment, rerun `python -m pip install -r requirements.txt`. You can still select a device directly from the command line. Replace `0` with your device index from `--list-devices`.
 
 ```powershell
 .\.venv\Scripts\python.exe fluentscope_next.py 0
+.\.venv\Scripts\python.exe fluentscope_next.py --list-devices
+.\.venv\Scripts\python.exe fluentscope_next.py --loopback
 ```
 
-You can also pass a unique substring of the device name or use `"exact:Device Name"` to match the full name. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
+`--loopback` captures the default Windows WASAPI output. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. Device indices depend on the audio backend and connected devices; check the list again after upgrading. Loopback uses the output device's native sample rate and channel count; the first two channels are displayed. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
 
 To enable CRT rendering, install ModernGL and use a graphics driver with OpenGL 3.3 core support. SciPy is optional and enables polyphase resampling for the CRT trace.
 
@@ -83,6 +89,7 @@ Copyright © 2026 src3453. FluentScope Next is distributed under the [MIT Licens
 | pygame | [LGPL 2.1](https://github.com/pygame/pygame/blob/2.6.1/docs/LGPL.txt) and [bundled library notices](https://github.com/pygame/pygame/tree/2.6.1/docs/licenses) |
 | SDL 2 | [zlib](https://github.com/libsdl-org/SDL/blob/SDL2/LICENSE.txt) |
 | PyAudio | [MIT](https://pypi.org/project/PyAudio/) |
+| PyAudioWPatch (Windows) | [MIT](https://github.com/s0d3s/PyAudioWPatch/blob/master/LICENSE.txt) |
 | PortAudio | [MIT](https://github.com/PortAudio/portaudio/blob/master/LICENSE.txt) |
 | ModernGL (optional) | [MIT](https://github.com/moderngl/moderngl/blob/main/LICENSE) |
 | glcontext (via ModernGL) | [MIT](https://github.com/moderngl/glcontext/blob/main/LICENSE) |

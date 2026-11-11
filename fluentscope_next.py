@@ -3,11 +3,17 @@ import math
 import os
 import sys
 import threading
-import unicodedata
 
 import numpy as np
 import pygame
-import pyaudio
+try:
+    if sys.platform != "win32":
+        raise ImportError
+    import pyaudiowpatch as pyaudio
+except ImportError:
+    import pyaudio
+
+from audio_devices import capture_devices, resolve_device, print_devices, open_capture, choose_device
 
 # ==========================
 # Audio Settings
@@ -1317,84 +1323,40 @@ def callback(in_data, frame_count, time_info, status):
 
 pa = pyaudio.PyAudio()
 
-INPUT_DEVICE_INDEX = None
+def prepare_capture(device):
+    return open_capture(pa, pyaudio, device, callback, CHUNK, RATE, CHANNELS)
+
 
 try:
-    INPUT_DEVICE_INDEX = int(sys.argv[1])
-except:
-    def calc_pad_len(string,expected_len):
-        count = 0
-        for c in string:
-            if unicodedata.east_asian_width(c) in "FWA":
-                count += 1
-        return expected_len - count
-    def print_devices():
-        print("|Index|NoIn| API | Device name                                        |")
-        print("+-----+----+-----+----------------------------------------------------+")
-        for i in range(pa.get_device_count()):
-            devs = pa.get_device_info_by_index(i)
-            if devs['maxInputChannels'] != 0:
-                try:
-                    api_name = pa.get_host_api_info_by_index(devs['hostApi'])['name']
-                except Exception:
-                    api_name = "?"
-                print(f"| {devs['index']:>3} | {devs['maxInputChannels']:>2} | {api_name:>3} | {devs['name']:<{calc_pad_len(devs['name'],50)}} |")
-        sys.exit(1)
-    if len(sys.argv) <= 1:
-        print("Error: Please set input device index. Here is the index of input devices:")
-        print_devices()
+    devices = capture_devices(pa)
+    if len(sys.argv) > 2:
+        raise ValueError('Pass one device index/name, --loopback, or --list-devices.')
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ('--list-devices', '--help', '-h'):
+            print('Usage: fluentscope_next.py [DEVICE | --loopback | --list-devices]')
+            print('Without arguments, opens the audio source picker.')
+            print_devices(devices)
+            pa.terminate()
+            sys.exit(0)
+        device_info = resolve_device(pa, devices, sys.argv[1])
+        stream, STREAM_OPEN_KWARGS = prepare_capture(device_info)
     else:
-        if sys.argv[1].isdigit():
-            INPUT_DEVICE_INDEX = int(sys.argv[1])
-            print(f"Input device #{INPUT_DEVICE_INDEX} selected by index.")
-            pass # proceed with the selected device index
-        devices = [pa.get_device_info_by_index(i)['name'] for i in range(pa.get_device_count())]
-        if sys.argv[1].startswith("exact:"):
-            device_name = sys.argv[1][6:]
-            if device_name in devices:
-                INPUT_DEVICE_INDEX = devices.index(device_name)
-                print(f"Input device '{device_name}' selected by exact name.")
-                pass # proceed with the selected device index by exact name
-        else:
-            matches = [item for item in devices if sys.argv[1] in item]
-            if len(matches) == 0:
-                print(f"Error: No input device found that matches '{sys.argv[1]}'. Here is the index of input devices:")
-                print_devices()
-            elif len(matches) > 1:
-                print(f"Error: Multiple input devices found that match '{sys.argv[1]}':")
-                for match in matches:
-                    print(f" - {match}")
-                print("Device name is ambiguous. Please specify exact device name with 'exact:[device_name]' or device index instead. Here is the index of input devices:")
-                print_devices()
-            else:
-                INPUT_DEVICE_INDEX = devices.index(matches[0])
-                print(f"Input device '{matches[0]}' selected by name.")
-                pass # proceed with the selected device index by name
+        selection = choose_device(pa, devices, prepare_capture)
+        if selection is None:
+            pa.terminate()
+            sys.exit(0)
+        device_info, (stream, STREAM_OPEN_KWARGS) = selection
+except Exception as exc:
+    print(f'Unable to start audio capture: {exc}')
+    print_devices(locals().get('devices', []))
+    pa.terminate()
+    sys.exit(1)
 
-def detect_input_channels():
-    try:
-        if INPUT_DEVICE_INDEX is None:
-            info = pa.get_default_input_device_info()
-        else:
-            info = pa.get_device_info_by_index(INPUT_DEVICE_INDEX)
-        available = int(info["maxInputChannels"])
-    except Exception:
-        return CHANNELS
-    return max(1, min(CHANNELS, 2, available))
-
-
-input_channels = detect_input_channels()
-print(f"Input channels: {input_channels} ({'stereo' if input_channels == 2 else 'mono'})")
-
-STREAM_OPEN_KWARGS = dict(
-    format=FORMAT,
-    channels=input_channels,
-    rate=RATE,
-    input=True,
-    frames_per_buffer=CHUNK,
-    input_device_index=INPUT_DEVICE_INDEX,
-    stream_callback=callback,
-)
+INPUT_DEVICE_INDEX = int(device_info['index'])
+input_channels = STREAM_OPEN_KWARGS['channels']
+RATE = STREAM_OPEN_KWARGS['rate']
+SPEC_F_MAX = RATE / 2
+print(f"Audio source: {device_info['name']} ({input_channels} channels, {RATE} Hz)")
 
 
 def open_audio_stream():
@@ -1427,7 +1389,7 @@ def recover_audio_stream():
         return False
 
 
-stream = open_audio_stream()
+stream.start_stream()
 
 # ==========================
 # Pygame
@@ -2351,7 +2313,7 @@ while running:
     else:
         trigger_info = trigger_mode
 
-    stereo_info = stereo_mode if input_channels == 2 else f"{stereo_mode} (mono in)"
+    stereo_info = stereo_mode if input_channels >= 2 else f"{stereo_mode} (mono in)"
 
     if view == VIEW_LISSAJOUS:
         if effective_lissajous_mode() == "Auto":
