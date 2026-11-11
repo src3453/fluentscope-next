@@ -23,7 +23,27 @@ def resolve_device(pa, devices, selector):
             index = int(selector)
         except ValueError:
             if selector.startswith('exact:'):
-                matches = [d for d in devices if d['name'] == selector[6:]]
+                name = selector[6:]
+                matches = [d for d in devices if d['name'] == name]
+                # Preserve full names containing colons, including numeric suffixes.
+                if not matches:
+                    name, separator, occurrence = name.rpartition(':')
+                    if separator and occurrence.isascii() and occurrence.isdecimal():
+                        matches = [d for d in devices if d['name'] == name]
+                        number = int(occurrence)
+                        if not 1 <= number <= len(matches):
+                            raise ValueError(
+                                f'Exact device occurrence {number} is out of range '
+                                f'for {name!r} ({len(matches)} matches; numbering starts at 1).')
+                        return matches[number - 1]
+                if len(matches) > 1:
+                    choices = '\n'.join(
+                        f'  "exact:{d["name"]}:{number}" '
+                        f'(device index {d["index"]}, {d.get("api_name", "unknown API")})'
+                        for number, d in enumerate(matches, 1))
+                    raise ValueError(
+                        f'Warning: {len(matches)} capture devices have the same exact name. '
+                        f'Select an occurrence (1-based) or a device index:\n{choices}')
             else:
                 matches = [d for d in devices if selector.casefold() in d['name'].casefold()]
         else:
@@ -35,9 +55,17 @@ def resolve_device(pa, devices, selector):
 
 
 def print_devices(devices):
+    from collections import Counter
+
+    counts = Counter(d['name'] for d in devices)
+    occurrences = Counter()
     for device in devices:
+        name = device['name']
+        occurrences[name] += 1
         kind = 'Output loopback' if device.get('isLoopbackDevice') else 'Input'
-        print(f"{device['index']:3}: [{kind} / {device['api_name']}] {device['name']}")
+        selector = (f'  [exact:{name}:{occurrences[name]}]'
+                    if counts[name] > 1 else '')
+        print(f"{device['index']:3}: [{kind} / {device['api_name']}] {name}{selector}")
 
 
 def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
