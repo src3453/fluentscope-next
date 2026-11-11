@@ -90,12 +90,14 @@ Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygam
 | F2 | Show or hide the level meter |
 | F3 | Show or hide the status text and menu button |
 | F4 | Reset the window to its default size (1000x600) |
+| F5 / Shift+F5 | Cycle the maximum frame rate: 30, 60, 120, 144, 180, 240, Unlimited (ignored while VSync is on) |
+| F6 | Toggle VSync (takes effect with the OpenGL window) |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
 | R / M | Cycle the trigger or stereo mode |
 | X / Shift+X | Cycle the Scope time span forward or backward |
 | P | Toggle step or smooth Scope lines (Pygame and GL Line renderers) |
-| A / H | Cycle scope gain control or toggle gain peak hold |
+| A / H | Cycle automatic gain control (Scope and Lissajous) or toggle gain peak hold |
 | J / K / D | Toggle the scope grid, fixed-gain dBFS labels, or AGC dBFS labels |
 | L / W / I | Cycle the X/Y mode, swap axes, or change axis inversion |
 | C / Shift+C | Cycle the trace renderer: CRT, GL Line, Pygame (needs OpenGL) |

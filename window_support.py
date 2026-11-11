@@ -76,6 +76,25 @@ def set_minimum_window_size(width, height):
         print(f'Warning: could not set the minimum window size: {exc}')
 
 
+def set_gl_swap_interval(interval):
+    """
+    VSync on / off for the current OpenGL context without recreating the window
+    (1 = sync to the display, 0 = immediate). Returns False if it failed.
+    """
+    try:
+        import ctypes
+
+        sdl = _sdl_library()
+        sdl.SDL_GL_SetSwapInterval.argtypes = [ctypes.c_int]
+        sdl.SDL_GL_SetSwapInterval.restype = ctypes.c_int
+        if sdl.SDL_GL_SetSwapInterval(int(interval)) != 0:
+            raise RuntimeError('SDL_GL_SetSwapInterval failed')
+        return True
+    except Exception as exc:
+        print(f'Warning: could not change VSync: {exc}')
+        return False
+
+
 def resize_window(width, height):
     """
     Resize the existing window in place (keeps an OpenGL context alive),

@@ -5,7 +5,8 @@ import sys
 import threading
 
 from window_support import (
-    configure_windowing, focus_window, resize_window, set_minimum_window_size, ui_font,
+    configure_windowing, focus_window, resize_window, set_gl_swap_interval,
+    set_minimum_window_size, ui_font,
 )
 
 configure_windowing()
@@ -188,8 +189,9 @@ SCOPE_AGC_DECAY_TIMES = {"High": 0.12, "Med": 0.35, "Low": 1.0} # seconds
 SCOPE_AGC_MODES = ("Off", *SCOPE_AGC_DECAY_TIMES)
 SCOPE_AGC_HOLD_TIME = 0.5 # seconds
 
-FPS = 180 # no effect when VSYNC is enabled
-VSYNC = False # if True, the display is synchronized with the monitor's refresh rate, otherwise it runs at a fixed FPS
+FPS = 180 # frame-rate cap; no effect when VSYNC is enabled ([F5] cycles FPS_OPTIONS)
+FPS_OPTIONS = (30, 60, 120, 144, 180, 240, 0) # 0 = unlimited
+VSYNC = False # [F6] if True, the display is synchronized with the monitor's refresh rate, otherwise it runs at up to FPS
 
 LINE_IS_STEP = True # start with step lines ([P] toggles; smooth = straight lines between samples)
 
@@ -519,8 +521,8 @@ def update_scope_peak_hold(peak, held_peak, remaining, dt):
     return (held_peak if remaining > 0.0 else peak), remaining
 
 
-def update_scope_gain(peak, gain, dt, decay_time):
-    target = SCOPE_GAIN
+def update_scope_gain(peak, gain, dt, decay_time, base=SCOPE_GAIN):
+    target = base
     if peak >= SCOPE_AGC_SILENCE:
         target *= min(1.0 / peak, SCOPE_AGC_MAX_BOOST)
     # Reduce gain immediately for louder signals, but ease into a quieter signal.
@@ -1456,6 +1458,11 @@ def load_settings():
 
 
 saved_settings = load_settings()
+# needed before the window opens (the swap interval is set at creation)
+if isinstance(saved_settings.get("vsync"), bool):
+    VSYNC = saved_settings["vsync"]
+if saved_settings.get("max_fps") in FPS_OPTIONS and type(saved_settings["max_fps"]) is int:
+    FPS = saved_settings["max_fps"]
 
 
 # ==========================
@@ -1559,6 +1566,8 @@ lissajous_mode = LISSAJOUS_MODE
 lissajous_delay = LISSAJOUS_AUTOCORR_DELAY
 lissajous_swap = LISSAJOUS_SWAP
 lissajous_invert = LISSAJOUS_INVERT
+lissajous_gain = LISSAJOUS_GAIN # follows the [A] AGC mode like scope_gain
+lissajous_held_peak, lissajous_hold_remaining = 0.0, 0.0
 detected_period = None
 theme_index = 0
 theme = THEMES[theme_index]
@@ -1784,6 +1793,8 @@ def current_settings():
         "lissajous_invert": lissajous_invert,
         "theme": theme["name"],
         "window_size": [WIDTH, HEIGHT],
+        "max_fps": FPS,
+        "vsync": VSYNC,
     })
     if gl_renderer is not None:
         data.pop("crt_enabled", None) # superseded by trace_renderer
@@ -1965,22 +1976,29 @@ def lissajous_rect():
     return left, top, side
 
 
-def build_lissajous_points(left, right, mix, round_pixels=True):
-    """(N, 2) screen points of the XY figure (int32, or float32 subpixel)."""
-
+def lissajous_signals(left, right, mix):
+    """The newest LISSAJOUS_POINTS (x, y) samples of the XY figure, before orientation."""
     if effective_lissajous_mode() == "Auto":
         # X = s[i], Y = s[i + delay]: newest sample pairs that both exist
         count = min(LISSAJOUS_POINTS, len(mix) - lissajous_delay)
-        x = mix[-count - lissajous_delay:-lissajous_delay]
-        y = mix[-count:]
-    else:
-        x = left[-LISSAJOUS_POINTS:]
-        y = right[-LISSAJOUS_POINTS:]
-    x, y = orient_lissajous(x, y)
+        return mix[-count - lissajous_delay:-lissajous_delay], mix[-count:]
+    return left[-LISSAJOUS_POINTS:], right[-LISSAJOUS_POINTS:]
+
+
+def lissajous_peak(left, right, mix):
+    """Largest |x| or |y| in the drawn window (the AGC keeps it inside the square)."""
+    x, y = lissajous_signals(left, right, mix)
+    return max(float(np.max(np.abs(x), initial=0.0)), float(np.max(np.abs(y), initial=0.0)))
+
+
+def build_lissajous_points(left, right, mix, round_pixels=True):
+    """(N, 2) screen points of the XY figure (int32, or float32 subpixel)."""
+
+    x, y = orient_lissajous(*lissajous_signals(left, right, mix))
 
     rect_left, rect_top, side = lissajous_rect()
     half = side / 2
-    scale = half * LISSAJOUS_GAIN
+    scale = half * lissajous_gain
     px = rect_left + half + np.clip(x * scale, -half, half)
     py = rect_top + half - np.clip(y * scale, -half, half)
     points = np.column_stack((px, py))
@@ -2121,7 +2139,7 @@ def beam_lissajous(left, right, mix, end_abs):
 
     rect_left, rect_top, side = lissajous_rect()
     half = side / 2
-    scale = half * LISSAJOUS_GAIN
+    scale = half * lissajous_gain
     px = upsample(rect_left + half + x * scale, CRT_UPSAMPLE, margin)
     py = upsample(rect_top + half - y * scale, CRT_UPSAMPLE, margin)
 
@@ -2190,7 +2208,7 @@ def render_gl(traces, left, right, mix, end_abs):
         return
 
     scene = (view, stereo_mode, theme_index, effective_lissajous_mode(), lissajous_swap,
-             lissajous_invert, view == VIEW_SCOPE and scope_agc_mode != "Off",
+             lissajous_invert, scope_agc_mode != "Off",
              scope_samples if view == VIEW_SCOPE else None)
     if scene != crt_scene:
         r.clear()
@@ -2263,6 +2281,8 @@ def menu_items():
             (pygame.K_F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
             (pygame.K_F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
             (pygame.K_F4, "F4", "Reset size ({}x{})".format(*DEFAULT_WINDOW_SIZE)),
+            (pygame.K_F5, "F5", f"Max FPS: {format_fps(FPS)}{' (VSync)' if VSYNC else ''}"),
+            (pygame.K_F6, "F6", f"VSync: {'On' if VSYNC else 'Off'}"),
         )),
         ("Scope", (
             (pygame.K_x, "X", f"Time span: {scope_time_span()}"),
@@ -2276,6 +2296,7 @@ def menu_items():
             (pygame.K_l, "L", f"XY mode: {lissajous_mode}"),
             (pygame.K_w, "W", f"Swap X/Y: {'On' if lissajous_swap else 'Off'}"),
             (pygame.K_i, "I", f"Invert: {lissajous_invert}"),
+            (pygame.K_a, "A", f"AGC: {agc}"),
             (pygame.K_COMMA, ",", "Decrease XY delay"),
             (pygame.K_PERIOD, ".", "Increase XY delay"),
         )),
@@ -2392,7 +2413,7 @@ def draw_menu():
 
 def hud_texts(detected_period):
     """Status lines, top to bottom, as (font, text); fields are separated by 3 spaces."""
-    texts = [(font, f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}")]
+    texts = [(font, f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   Max:{'VSync' if VSYNC else format_fps(FPS)}")]
 
     if trigger_mode in ("FFT", "Hybrid", "Corr"):
         trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
@@ -2411,6 +2432,10 @@ def hud_texts(detected_period):
             f"View:{VIEW_NAMES[view]}   Theme:{theme['name']}   Lissajous:{liss_info}"
             f"   Swap:{'ON' if lissajous_swap else 'OFF'}   Invert:{lissajous_invert}"
         )
+        agc_status = scope_agc_mode
+        if scope_agc_mode != "Off":
+            agc_status += f" x{lissajous_gain / LISSAJOUS_GAIN:.2f}"
+        help_text += f"   AGC:{agc_status}"
     else:
         help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
         if view == VIEW_SCOPE:
@@ -2467,6 +2492,23 @@ def layout_hud(texts):
     return lines
 
 
+def format_fps(value):
+    return "Unlimited" if value == 0 else str(value)
+
+
+def set_vsync(enabled):
+    """Switch VSync in place: the GL swap interval, or a recreated plain window."""
+    global VSYNC
+    if gl_renderer is not None:
+        if not set_gl_swap_interval(1 if enabled else 0):
+            return
+        VSYNC = enabled
+    else:
+        VSYNC = enabled
+        pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
+        apply_window_size(*pygame.display.get_window_size())
+
+
 def reset_window_size():
     """Back to DEFAULT_WINDOW_SIZE (un-maximizes first)."""
     if gl_renderer is None:
@@ -2490,7 +2532,8 @@ print(r"""     ______              __  ____
   (c) 2026 src3453 Released under The MIT License.""")
 print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
 print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button  [F4] Reset window size")
-print("        [A] Scope AGC Off/High/Med/Low  [D] AGC dBFS labels  [H] AGC peak hold")
+print("        [F5] Max FPS (+Shift: back)  [F6] VSync")
+print("        [A] AGC Off/High/Med/Low (Scope & Lissajous)  [D] AGC dBFS labels  [H] AGC peak hold")
 print("        [J] Scope grid  [K] Fixed-gain dBFS labels")
 print("        [X]/[Shift+X] Scope time span  [P] Scope step / smooth line")
 print("        [W] Lissajous swap X/Y  [I] invert Off/X/Y/XY (+Shift: back)")
@@ -2552,6 +2595,12 @@ while running:
                 layout_menu()
             elif event.key == pygame.K_F4:
                 reset_window_size()
+            elif event.key == pygame.K_F5:
+                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
+                FPS = FPS_OPTIONS[(FPS_OPTIONS.index(FPS) + step) % len(FPS_OPTIONS)] \
+                    if FPS in FPS_OPTIONS else FPS_OPTIONS[0]
+            elif event.key == pygame.K_F6:
+                set_vsync(not VSYNC)
             elif event.key == pygame.K_TAB:
                 view = (view + 1) % len(VIEW_NAMES)
             elif event.key == pygame.K_1:
@@ -2600,6 +2649,7 @@ while running:
                 scope_agc_mode = cycle(SCOPE_AGC_MODES, scope_agc_mode)
                 if scope_agc_mode == "Off":
                     scope_gain = SCOPE_GAIN
+                    lissajous_gain = LISSAJOUS_GAIN
             elif event.key == pygame.K_d:
                 show_scope_agc_dbfs_scale = not show_scope_agc_dbfs_scale
             elif event.key == pygame.K_j:
@@ -2691,6 +2741,20 @@ while running:
         scope_gain = SCOPE_GAIN
         scope_held_peak, scope_hold_remaining = 0.0, 0.0
 
+    if view == VIEW_LISSAJOUS and scope_agc_mode != "Off":
+        peak = lissajous_peak(left, right, mix)
+        if scope_agc_peak_hold:
+            lissajous_held_peak, lissajous_hold_remaining = update_scope_peak_hold(
+                peak, lissajous_held_peak, lissajous_hold_remaining, dt,
+            )
+            peak = lissajous_held_peak
+        lissajous_gain = update_scope_gain(
+            peak, lissajous_gain, dt, SCOPE_AGC_DECAY_TIMES[scope_agc_mode], LISSAJOUS_GAIN,
+        )
+    else:
+        lissajous_gain = LISSAJOUS_GAIN
+        lissajous_held_peak, lissajous_hold_remaining = 0.0, 0.0
+
     hud_lines = layout_hud(hud_texts(detected_period)) if show_hud else []
     hud_bottom = max((pos[1] + text_font.get_height() for text_font, _, pos in hud_lines), default=0)
 
@@ -2721,7 +2785,7 @@ while running:
 
     pygame.display.flip()
 
-    if VSYNC:
+    if VSYNC or FPS == 0:
         dt = clock.tick() / 1000.0
     else:
         dt = clock.tick(FPS) / 1000.0
