@@ -1,5 +1,10 @@
 """Audio source discovery and the startup device picker (no capture on import)."""
 
+import json
+from pathlib import Path
+import subprocess
+import sys
+
 
 def capture_devices(pa):
     devices = []
@@ -9,13 +14,20 @@ def capture_devices(pa):
             info['index'] = index
             info['api_name'] = pa.get_host_api_info_by_index(info['hostApi'])['name']
             devices.append(info)
+    if sys.platform == 'darwin':
+        from macos_loopback import system_audio_device
+        devices.append(system_audio_device())
     return devices
 
 
 def resolve_device(pa, devices, selector):
     if selector == '--loopback':
+        native = [d for d in devices if d.get('capture_backend') == 'screencapturekit']
+        if native:
+            return native[0]
         if not hasattr(pa, 'get_default_wasapi_loopback'):
-            raise ValueError('WASAPI loopback requires PyAudioWPatch on Windows.')
+            raise ValueError('Native loopback requires macOS 13+ or PyAudioWPatch on Windows. '
+                             'Otherwise select a monitor/virtual input by name or index.')
         index = int(pa.get_default_wasapi_loopback()['index'])
         matches = [d for d in devices if d['index'] == index]
     else:
@@ -71,6 +83,9 @@ def print_devices(devices):
 def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
                  preferred_channels=2):
     """Use the endpoint's native format for WASAPI loopback, including surround."""
+    if device.get('capture_backend') == 'screencapturekit':
+        from macos_loopback import MacOSLoopbackStream
+        return MacOSLoopbackStream(callback, chunk), dict(channels=2, rate=48000)
     channels = int(device['maxInputChannels'])
     if not device.get('isLoopbackDevice'):
         channels = min(preferred_channels, 2, channels)
@@ -91,6 +106,39 @@ def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
 
 
 def choose_device(pa, devices, open_device):
+    """Isolate Cocoa Tk from SDL on macOS, including Tk's reopen handlers."""
+    if sys.platform != 'darwin':
+        return _choose_device(pa, devices, open_device)
+    try:
+        default_input = int(pa.get_default_input_device_info()['index'])
+    except (AttributeError, OSError, ValueError, LookupError):
+        default_input = None
+    payload = dict(devices=devices, default_input=default_input,
+                   selected_index=None, initial_status=None)
+    while True:
+        picker = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), '--picker'],
+            input=json.dumps(payload), capture_output=True, text=True)
+        if picker.returncode:
+            raise OSError(f'Audio source picker failed: {picker.stderr.strip()}')
+        try:
+            index = json.loads(picker.stdout)
+        except ValueError as exc:
+            raise OSError('Audio source picker returned an invalid selection.') from exc
+        if index is None:
+            return None
+        device = next((d for d in devices if d['index'] == index), None)
+        if device is None:
+            raise OSError('The selected audio device is no longer available.')
+        try:
+            return device, open_device(device)
+        except (OSError, ValueError) as exc:
+            payload['selected_index'] = index
+            payload['initial_status'] = (
+                f'Could not open this device: {exc}. Select another device and retry.')
+
+
+def _choose_device(pa, devices, open_device, initial_status=None, selected_index=None):
     """Keep the picker open on capture errors so another endpoint can be tried."""
     import tkinter as tk
     from tkinter import ttk
@@ -100,7 +148,9 @@ def choose_device(pa, devices, open_device):
     root.geometry('900x480')
     root.minsize(640, 360)
     result = None
-    mode = tk.StringVar(value='Input')
+    selected_device = next((d for d in devices if d['index'] == selected_index), {})
+    mode = tk.StringVar(value='Output loopback' if selected_device.get('isLoopbackDevice')
+                        else 'Input')
     status = tk.StringVar(value='Select an audio source, then click Start.')
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill='both', expand=True)
@@ -127,11 +177,13 @@ def choose_device(pa, devices, open_device):
         visible = [d for d in devices if bool(d.get('isLoopbackDevice')) == loopback]
         default_index = None
         try:
-            default = (pa.get_default_wasapi_loopback() if loopback else
+            default = (resolve_device(pa, devices, '--loopback') if loopback else
                        pa.get_default_input_device_info())
             default_index = int(default['index'])
         except (AttributeError, OSError, ValueError, LookupError):
             pass
+        if any(d['index'] == selected_index for d in visible):
+            default_index = selected_index
         for d in visible:
             tree.insert('', 'end', iid=str(d['index']), text=f"{d['index']}: {d['name']}",
                         values=(d['api_name'], int(d['maxInputChannels']),
@@ -144,9 +196,13 @@ def choose_device(pa, devices, open_device):
             tree.see(selected)
         start.configure(state='normal' if visible else 'disabled')
         status.set('Select an audio source, then click Start.' if visible else
-                   ('No loopback devices. On Windows, install PyAudioWPatch; on other '
-                    'systems, select a monitor/virtual input under Input.' if loopback else
+                   ('No loopback devices. On Windows, install PyAudioWPatch; on Linux, '
+                    'select a monitor/virtual input under Input.' if loopback else
                     'No input devices are available.'))
+        if loopback and any(d.get('capture_backend') == 'screencapturekit' for d in visible):
+            status.set('macOS 13+: captures system audio without a driver. On first use, '
+                       'builds a helper using Apple Command Line Tools. Allow Screen & '
+                       'System Audio Recording in System Settings > Privacy & Security.')
 
     for label in ('Input', 'Output loopback'):
         ttk.Radiobutton(modes, text=label, variable=mode, value=label,
@@ -176,6 +232,20 @@ def choose_device(pa, devices, open_device):
     root.bind('<Return>', launch)
     root.bind('<Escape>', lambda event: root.destroy())
     populate()
+    if initial_status:
+        status.set(initial_status)
     tree.focus_set()
     root.mainloop()
     return result
+
+
+if __name__ == '__main__' and sys.argv[1:] == ['--picker']:
+    from types import SimpleNamespace
+
+    payload = json.load(sys.stdin)
+    pa = SimpleNamespace(get_default_input_device_info=lambda: dict(
+        index=payload['default_input'] if payload['default_input'] is not None else -1))
+    result = _choose_device(
+        pa, payload['devices'], lambda device: device['index'],
+        payload['initial_status'], payload['selected_index'])
+    print(json.dumps(result[0]['index'] if result else None))

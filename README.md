@@ -40,7 +40,7 @@ py -3.12 -m venv .venv
 
 Without a device argument, the last command opens a startup menu. Select **Input** for a microphone or line input, or **Output loopback** to capture audio playing through a Windows output device, then click **Start** (or double-click the device). Capture errors are shown in the menu so you can try another device. Cancel or Escape exits.
 
-Windows uses [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI output loopback; no Stereo Mix device or virtual audio cable is required. On other platforms, PyAudio is used; select an OS-provided monitor or virtual input under **Input** for output capture. The startup menu requires Tkinter (included with standard Python on Windows; often packaged as `python3-tk` on Linux).
+Windows uses [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI output loopback; no Stereo Mix device or virtual audio cable is required. macOS 13+ uses Apple's ScreenCaptureKit for driver-free system audio capture (see below). On Linux, select an OS-provided monitor or virtual input under **Input** for output capture. The startup menu requires Tkinter (included with standard Python on Windows; often packaged as `python3-tk` on Linux).
 
 To update an existing environment, rerun `python -m pip install -r requirements.txt`. You can still select a device directly from the command line. Replace `0` with your device index from `--list-devices`.
 
@@ -50,7 +50,29 @@ To update an existing environment, rerun `python -m pip install -r requirements.
 .\.venv\Scripts\python.exe fluentscope_next.py --loopback
 ```
 
-`--loopback` captures the default Windows WASAPI output. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. If several capture devices have that exact name, startup stops with a warning and lists selectors such as `"exact:Device Name:1"` and `"exact:Device Name:2"`. The final number is the 1-based occurrence among devices with the same name, in `--list-devices` order (across audio APIs); duplicate entries in that list also show their numbered selectors. Names containing colons are supported; a matching full device name takes precedence over interpreting its final colon as an occurrence suffix. Device indices and occurrence order depend on the audio backend and connected devices; check the list again after upgrading. Loopback uses the output device's native sample rate and channel count; the first two channels are displayed. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
+`--loopback` captures the default Windows WASAPI output, or system audio on macOS 13+. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. If several capture devices have that exact name, startup stops with a warning and lists selectors such as `"exact:Device Name:1"` and `"exact:Device Name:2"`. The final number is the 1-based occurrence among devices with the same name, in `--list-devices` order (across audio APIs); duplicate entries in that list also show their numbered selectors. Names containing colons are supported; a matching full device name takes precedence over interpreting its final colon as an occurrence suffix. Device indices and occurrence order depend on the audio backend and connected devices; check the list again after upgrading. Windows loopback uses the output device's native sample rate and channel count; the first two channels are displayed. macOS system audio uses stereo at 48 kHz. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
+
+### macOS
+
+Use macOS 13 (Ventura) or later for system audio capture. Install Python 3.12+ with Tkinter, PortAudio, and Apple Command Line Tools. For example, with Homebrew Python 3.12:
+
+```sh
+xcode-select --install
+brew install python@3.12 python-tk@3.12 portaudio
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python fluentscope_next.py --loopback
+```
+
+Alternatively, run without arguments and select **Output loopback → macOS System Audio**. No BlackHole, virtual driver, or output-device routing change is needed. This captures the system audio mix rather than an individual hardware output. A connected display is required by the [ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit) content filter. The helper registers only an audio output; screen frames are not read or saved.
+
+The Swift helper in `native/macos_loopback.swift` is compiled on first use and cached in `~/Library/Caches/FluentScopeNext`. The first build may take a few minutes. Allow the macOS recording permission when prompted. If access is denied or startup times out, enable the launching terminal/app or capture helper in **System Settings → Privacy & Security → Screen & System Audio Recording** (named **Screen Recording** on older macOS releases), restart the launching app, and retry. Ordinary microphone inputs require the separate **Microphone** permission. Device listing does not request recording access. Older macOS releases can still use ordinary or virtual input devices; native system audio requires 13+.
+
+To check the automated audio discovery and stream lifecycle tests:
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 To enable the OpenGL renderers (CRT and GL Line), install ModernGL and use a graphics driver with OpenGL 3.3 core support. SciPy is optional and enables polyphase resampling for the CRT trace. `requirements-full.txt` installs the required packages plus all optional ones:
 

@@ -4,6 +4,10 @@ import os
 import sys
 import threading
 
+from window_support import configure_windowing, focus_window, ui_font
+
+configure_windowing()
+
 import numpy as np
 import pygame
 try:
@@ -1385,7 +1389,7 @@ print(f"Audio source: {device_info['name']} ({input_channels} channels, {RATE} H
 
 
 def open_audio_stream():
-    audio_stream = pa.open(**STREAM_OPEN_KWARGS)
+    audio_stream, _ = prepare_capture(device_info)
     audio_stream.start_stream()
     return audio_stream
 
@@ -1422,6 +1426,10 @@ stream.start_stream()
 
 pygame.init()
 
+# Load fonts before showing a window so its event loop can start immediately.
+font = ui_font(18)
+small_font = ui_font(13)
+
 
 def open_gl_window():
     """
@@ -1436,6 +1444,9 @@ def open_gl_window():
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
         pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+        if sys.platform == 'darwin':
+            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_FLAGS,
+                                            pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG)
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
         pygame.display.set_mode(
             (WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF, vsync=1 if VSYNC else 0
@@ -1460,9 +1471,6 @@ else:
 pygame.display.set_caption("FluentScope Next")
 
 clock = pygame.time.Clock()
-
-font = pygame.font.SysFont("consolas", 18)
-small_font = pygame.font.SysFont("consolas", 13)
 
 # ==========================
 # View State
@@ -2221,10 +2229,18 @@ if gl_renderer is not None:
 
 running = True
 dt = 0.0
+focus_window()
 
 while running:
 
     for event in pygame.event.get():
+
+        if event.type == pygame.WINDOWTAKEFOCUS:
+            focus_window()
+            continue
+
+        if event.type == pygame.MOUSEBUTTONDOWN and not pygame.key.get_focused():
+            focus_window()
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if MENU_BUTTON.collidepoint(event.pos):
