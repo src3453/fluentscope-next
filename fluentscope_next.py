@@ -193,8 +193,18 @@ SPEC_OVERLAY_RATIO = 0.4 # height ratio of the spectrum overlay on the scope vie
 # The window is an SDL OpenGL window; the 2D UI is still drawn with pygame onto an
 # offscreen surface and composited under the beam.
 
-USE_OPENGL = True # False = plain pygame window (no CRT option)
-CRT_ENABLED = True # start with the CRT beam renderer ([C] toggles)
+USE_OPENGL = True # False = plain pygame window (no CRT / GL line option)
+
+# Trace renderer ([C] cycles, needs OpenGL):
+#   "CRT"     - analog beam (settings below)
+#   "GL Line" - plain lines drawn with OpenGL: free width, optional anti-aliasing
+#   "Pygame"  - plain 2D lines drawn by pygame
+TRACE_RENDERERS = ["CRT", "GL Line", "Pygame"]
+TRACE_RENDERER = "CRT"
+
+LINE_WIDTHS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0] # GL line width in pixels ([N])
+LINE_WIDTH = 2.0
+LINE_AA = True # GL line anti-aliasing ([O])
 
 CRT_BEAM_WIDTHS = [0.6, 0.9, 1.3, 1.8, 2.5, 3.5] # beam spot sigma in pixels ([F] focus)
 CRT_BEAM_WIDTH = 1.3
@@ -517,6 +527,7 @@ def build_waveform_points(
     gain: float,
     line_is_step: bool,
     top: int = 0,
+    round_pixels: bool = True,
 ):
 
     waveform_len = len(waveform)
@@ -540,6 +551,8 @@ def build_waveform_points(
     else:
         points = np.column_stack((x, y))
 
+    if not round_pixels:
+        return points.astype(np.float32, copy=False)
     return np.rint(points).astype(np.int32, copy=False)
 
 
@@ -1179,10 +1192,13 @@ class SpectrumAnalyzer:
     def normalized(self, values):
         return (values - self.db_min) / (self.db_max - self.db_min)
 
-    def line_points(self, top, height):
+    def line_points(self, top, height, round_pixels=True):
         x = np.arange(self.width, dtype=np.float32)
         y = top + (1.0 - self.normalized(self.smoothed)) * (height - 1)
-        return np.rint(np.column_stack((x, y))).astype(np.int32)
+        points = np.column_stack((x, y))
+        if not round_pixels:
+            return points.astype(np.float32)
+        return np.rint(points).astype(np.int32)
 
 
 SPEC_FREQ_TICKS = [
@@ -1226,15 +1242,24 @@ def draw_spectrum_labels(surface, analyzer, theme, small_font, top, height, show
             surface.blit(text, (analyzer.width - text.get_width() - 4, y + 2))
 
 
-def draw_spectrum(surface, analyzer, theme, top, height, filled):
-    points = analyzer.line_points(top, height)
+def draw_spectrum(surface, analyzer, theme, top, height, filled, line_queue=None):
+    """
+    line_queue: list to receive (points, color, scissor, width scale) for the
+    OpenGL line renderer instead of drawing the line with pygame (the fill is
+    always drawn here).
+    """
+    points = analyzer.line_points(top, height, round_pixels=line_queue is None)
 
     if filled:
         bottom = top + height - 1
         polygon = np.vstack((points, [[analyzer.width - 1, bottom], [0, bottom]]))
         pygame.draw.polygon(surface, theme["fill"], polygon)
 
-    pygame.draw.lines(surface, theme["spectrum"], False, points, 1 if not filled else 2)
+    if line_queue is not None:
+        # overlay at half the trace width, like the pygame 1 px / 2 px lines
+        line_queue.append((points, theme["spectrum"], (0, top, analyzer.width, height), 1.0 if filled else 0.5))
+    else:
+        pygame.draw.lines(surface, theme["spectrum"], False, points, 1 if not filled else 2)
 
 
 class Waterfall:
@@ -1417,7 +1442,7 @@ def open_gl_window():
         )
         renderer = CRTRenderer(moderngl.create_context(), WIDTH, HEIGHT)
     except Exception as exc:
-        print(f"Warning: OpenGL renderer unavailable, CRT mode disabled ({exc})")
+        print(f"Warning: OpenGL renderer unavailable, CRT / GL line modes disabled ({exc})")
         return None
 
     print(f"OpenGL: {renderer.ctx.info['GL_RENDERER']} ({renderer.ctx.info['GL_VERSION']})")
@@ -1469,7 +1494,20 @@ detected_period = None
 theme_index = 0
 theme = THEMES[theme_index]
 
-crt_enabled = CRT_ENABLED and gl_renderer is not None
+trace_renderer = TRACE_RENDERER if gl_renderer is not None else "Pygame"
+line_width = LINE_WIDTH
+line_aa = LINE_AA
+spectrum_lines = [] # spectrum lines for the OpenGL line renderer, refilled every frame
+
+
+def gl_line_queue():
+    """
+    Where plain lines (spectrum) go: a list drawn by the OpenGL line renderer, or
+    None to draw them with pygame (no ModernGL, or the Pygame renderer selected).
+    """
+    if gl_renderer is None or trace_renderer == "Pygame":
+        return None
+    return spectrum_lines
 crt_beam_width = CRT_BEAM_WIDTH
 crt_persistence = CRT_PERSISTENCE
 crt_exposure = CRT_EXPOSURE
@@ -1532,7 +1570,8 @@ def apply_settings(data):
     global lissajous_swap, lissajous_invert
     global show_scope_graticule, show_scope_dbfs_scale, scope_samples
     global scope_agc_mode, show_scope_agc_dbfs_scale, scope_agc_peak_hold
-    global crt_enabled, crt_beam_width, crt_persistence, crt_exposure, crt_gamma, crt_bloom
+    global trace_renderer, line_width, line_aa
+    global crt_beam_width, crt_persistence, crt_exposure, crt_gamma, crt_bloom
 
     def number(key, lo, hi):
         value = data.get(key)
@@ -1577,8 +1616,15 @@ def apply_settings(data):
         set_theme(names.index(data["theme"]))
 
     if gl_renderer is not None:
-        if isinstance(data.get("crt_enabled"), bool):
-            crt_enabled = data["crt_enabled"]
+        if data.get("trace_renderer") in TRACE_RENDERERS:
+            trace_renderer = data["trace_renderer"]
+        elif isinstance(data.get("crt_enabled"), bool): # older settings files
+            trace_renderer = "CRT" if data["crt_enabled"] else "Pygame"
+        value = number("line_width", 0.05, 64.0)
+        if value is not None:
+            line_width = float(value)
+        if isinstance(data.get("line_aa"), bool):
+            line_aa = data["line_aa"]
         if isinstance(data.get("crt_bloom"), bool):
             crt_bloom = data["crt_bloom"]
         value = number("crt_beam_width", 0.01, 100.0)
@@ -1616,8 +1662,11 @@ def current_settings():
         "theme": theme["name"],
     })
     if gl_renderer is not None:
+        data.pop("crt_enabled", None) # superseded by trace_renderer
         data.update({
-            "crt_enabled": crt_enabled,
+            "trace_renderer": trace_renderer,
+            "line_width": line_width,
+            "line_aa": line_aa,
             "crt_beam_width": crt_beam_width,
             "crt_persistence": crt_persistence,
             "crt_exposure": crt_exposure,
@@ -1736,7 +1785,7 @@ def draw_scope(traces):
         draw_scope_graticule(lanes)
 
     if show_overlay:
-        draw_spectrum(screen, analyzer, theme, overlay_top, overlay_height, False)
+        draw_spectrum(screen, analyzer, theme, overlay_top, overlay_height, False, gl_line_queue())
         draw_spectrum_labels(screen, analyzer, theme, small_font, overlay_top, overlay_height, False)
 
     show_dbfs_scale = show_scope_dbfs_scale if scope_agc_mode == "Off" else show_scope_agc_dbfs_scale
@@ -1744,7 +1793,7 @@ def draw_scope(traces):
         for top, height in lanes:
             draw_scope_dbfs_scale(top, height)
 
-    if not crt_enabled: # CRT: traces are drawn by beam_scope() on the GPU
+    if trace_renderer == "Pygame": # otherwise drawn on the GPU in render_gl()
         for waveform, color, top, height in traces:
             draw_trace(waveform, color, top, height)
 
@@ -1761,7 +1810,7 @@ def draw_scope(traces):
 
 def draw_spectrum_view():
     draw_spectrum_grid(screen, analyzer, theme, 0, SPLIT_Y)
-    draw_spectrum(screen, analyzer, theme, 0, SPLIT_Y, True)
+    draw_spectrum(screen, analyzer, theme, 0, SPLIT_Y, True, gl_line_queue())
     draw_spectrum_labels(screen, analyzer, theme, small_font, 0, SPLIT_Y, True)
 
     screen.blit(waterfall.surface, (0, SPLIT_Y))
@@ -1790,8 +1839,8 @@ def lissajous_rect():
     return left, LISSAJOUS_TOP, side
 
 
-def build_lissajous_points(left, right, mix):
-    """(N, 2) int32 screen points of the XY figure."""
+def build_lissajous_points(left, right, mix, round_pixels=True):
+    """(N, 2) screen points of the XY figure (int32, or float32 subpixel)."""
 
     if effective_lissajous_mode() == "Auto":
         # X = s[i], Y = s[i + delay]: newest sample pairs that both exist
@@ -1808,7 +1857,10 @@ def build_lissajous_points(left, right, mix):
     scale = half * LISSAJOUS_GAIN
     px = rect_left + half + np.clip(x * scale, -half, half)
     py = rect_top + half - np.clip(y * scale, -half, half)
-    return np.rint(np.column_stack((px, py))).astype(np.int32)
+    points = np.column_stack((px, py))
+    if not round_pixels:
+        return points.astype(np.float32)
+    return np.rint(points).astype(np.int32)
 
 
 def draw_lissajous(points):
@@ -1957,15 +2009,47 @@ def beam_lissajous(left, right, mix, end_abs):
     )
 
 
+def line_scope(traces):
+    for waveform, color, top, height in traces:
+        points = build_waveform_points(
+            waveform, PLOT_WIDTH, height, scope_gain, LINE_IS_STEP, top, round_pixels=False,
+        )
+        if points is not None:
+            gl_renderer.draw_line(points, color01(color), scissor=(0, top, PLOT_WIDTH, height))
+
+
+def line_lissajous(left, right, mix):
+    rect_left, rect_top, side = lissajous_rect()
+    points = build_lissajous_points(left, right, mix, round_pixels=False)
+    gl_renderer.draw_line(points, color01(theme["trace"]), scissor=(rect_left, rect_top, side, side))
+
+
 def render_gl(traces, left, right, mix, end_abs):
-    """Upload the pygame-drawn UI, add the beam (CRT mode) and composite to the window."""
+    """Upload the pygame-drawn UI, add the traces (CRT / GL line) and composite to the window."""
 
     global crt_scene, lissajous_beam_end
 
     r = gl_renderer
     r.upload_ui(screen)
+    ui_rect = tuple(MENU_PANEL) if menu_open else None
+    trace_view = view in (VIEW_SCOPE, VIEW_LISSAJOUS)
 
-    if not (crt_enabled and view in (VIEW_SCOPE, VIEW_LISSAJOUS)):
+    # plain line layer: spectrum, then the GL Line traces on top
+    gl_traces = trace_renderer == "GL Line" and trace_view
+    if spectrum_lines or gl_traces:
+        r.line_width = line_width
+        r.line_aa = line_aa
+        r.begin_lines()
+        for points, color, scissor, scale in spectrum_lines:
+            r.draw_line(points, color01(color), scissor=scissor, width=line_width * scale)
+        if gl_traces:
+            if view == VIEW_SCOPE:
+                line_scope(traces)
+            else:
+                line_lissajous(left, right, mix)
+    spectrum_lines.clear()
+
+    if not (trace_renderer == "CRT" and trace_view):
         crt_scene = None
         lissajous_beam_end = None
         r.present(False)
@@ -1996,7 +2080,7 @@ def render_gl(traces, left, right, mix, end_abs):
         beam_scope(traces)
     else:
         beam_lissajous(left, right, mix, end_abs)
-    r.present(True, ui_rect=tuple(MENU_PANEL) if menu_open else None)
+    r.present(True, ui_rect=ui_rect)
 
 
 def step_option(options, current, step):
@@ -2012,12 +2096,16 @@ def format_seconds(value):
     return f"{value * 1000:.0f}ms" if value < 1.0 else f"{value:.1f}s"
 
 
+def format_line_width(value):
+    return f"{value:g}px"
+
+
 def cycle(options, current):
     return options[(options.index(current) + 1) % len(options)]
 
 
 MENU_BUTTON = pygame.Rect(PLOT_WIDTH - 122, 6, 112, 24)
-MENU_PANEL = pygame.Rect(PLOT_WIDTH - 894, 36, 884, 190)
+MENU_PANEL = pygame.Rect(PLOT_WIDTH - 894, 36, 884, 232)
 
 
 def scale_controls():
@@ -2059,14 +2147,21 @@ def menu_items():
         )),
     ]
     if gl_renderer is not None:
-        groups.append(("CRT", (
-            (pygame.K_c, "C", f"Beam: {'On' if crt_enabled else 'Off'}"),
-            (pygame.K_e, "E", f"Exposure: {crt_exposure:.2f}"),
-            (pygame.K_f, "F", f"Focus: {crt_beam_width:.1f}px"),
-            (pygame.K_g, "G", f"Afterglow: {format_seconds(crt_persistence)}"),
-            (pygame.K_b, "B", f"Bloom: {'On' if crt_bloom else 'Off'}"),
-            (pygame.K_v, "V", f"Gamma: {crt_gamma:.1f}"),
-        )))
+        items = [(pygame.K_c, "C", f"Renderer: {trace_renderer}")]
+        if trace_renderer == "CRT":
+            items += [
+                (pygame.K_e, "E", f"Exposure: {crt_exposure:.2f}"),
+                (pygame.K_f, "F", f"Focus: {crt_beam_width:.1f}px"),
+                (pygame.K_g, "G", f"Afterglow: {format_seconds(crt_persistence)}"),
+                (pygame.K_b, "B", f"Bloom: {'On' if crt_bloom else 'Off'}"),
+                (pygame.K_v, "V", f"Gamma: {crt_gamma:.1f}"),
+            ]
+        if trace_renderer != "Pygame": # GL lines: traces in GL Line mode, spectrum in both
+            items += [
+                (pygame.K_n, "N", f"Line width: {format_line_width(line_width)}"),
+                (pygame.K_o, "O", f"Anti-aliasing: {'On' if line_aa else 'Off'}"),
+            ]
+        groups.append(("Renderer", tuple(items)))
     return groups
 
 
@@ -2120,7 +2215,9 @@ print("        [X]/[Shift+X] Scope time span")
 print("        [W] Lissajous swap X/Y  [I] invert Off/X/Y/XY (+Shift: back)")
 print("        [L] Lissajous L/R <-> Auto  [,] [.] (or [ and ]) autocorrelation delay -1 / +1 (+Shift: x0.5 / x2)")
 if gl_renderer is not None:
-    print("        [C] CRT beam  [E] exposure  [F] focus  [G] afterglow  [V] gamma (+Shift: down)  [B] bloom")
+    print("        [C] renderer CRT / GL Line / Pygame (+Shift: back)")
+    print("        CRT:     [E] exposure  [F] focus  [G] afterglow  [V] gamma (+Shift: down)  [B] bloom")
+    print("        Lines:   [N] line width (+Shift: thinner)  [O] anti-aliasing (GL Line traces, spectrum)")
 
 running = True
 dt = 0.0
@@ -2214,10 +2311,15 @@ while running:
                 scope_agc_peak_hold = not scope_agc_peak_hold
                 scope_held_peak, scope_hold_remaining = 0.0, 0.0
             elif gl_renderer is not None:
-                # CRT beam controls (Shift = the other direction)
+                # renderer / CRT beam / GL line controls (Shift = the other direction)
                 step = -1 if event.mod & pygame.KMOD_SHIFT else 1
                 if event.key == pygame.K_c:
-                    crt_enabled = not crt_enabled
+                    index = TRACE_RENDERERS.index(trace_renderer) + step
+                    trace_renderer = TRACE_RENDERERS[index % len(TRACE_RENDERERS)]
+                elif event.key == pygame.K_n:
+                    line_width = step_option(LINE_WIDTHS, line_width, step)
+                elif event.key == pygame.K_o:
+                    line_aa = not line_aa
                 elif event.key == pygame.K_g:
                     crt_persistence = step_option(CRT_PERSISTENCES, crt_persistence, step)
                 elif event.key == pygame.K_f:
@@ -2285,7 +2387,7 @@ while running:
     if view == VIEW_SCOPE:
         draw_scope(traces)
     elif view == VIEW_LISSAJOUS:
-        draw_lissajous(None if crt_enabled else build_lissajous_points(left, right, mix))
+        draw_lissajous(build_lissajous_points(left, right, mix) if trace_renderer == "Pygame" else None)
     else:
         draw_spectrum_view()
 
@@ -2346,15 +2448,21 @@ while running:
         screen.blit(small_font.render(agc_text, True, theme["text"]), (10, 62))
 
     if gl_renderer is not None:
-        if crt_enabled:
-            crt_text = (
-                f"CRT:ON   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
+        if trace_renderer == "CRT":
+            renderer_text = (
+                f"Renderer:CRT   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
                 f"   Afterglow:{format_seconds(crt_persistence)}   Bloom:{'ON' if crt_bloom else 'OFF'}"
                 f"   Gamma:{crt_gamma:.1f}{' (ink: 1.0)' if theme_is_light() else ''}"
+                f"   Line:{format_line_width(line_width)} AA:{'ON' if line_aa else 'OFF'}"
+            )
+        elif trace_renderer == "GL Line":
+            renderer_text = (
+                f"Renderer:GL Line   Width:{format_line_width(line_width)}"
+                f"   AA:{'ON' if line_aa else 'OFF'}"
             )
         else:
-            crt_text = "CRT:OFF"
-        screen.blit(small_font.render(crt_text, True, theme["text"]), (10, 47))
+            renderer_text = "Renderer:Pygame"
+        screen.blit(small_font.render(renderer_text, True, theme["text"]), (10, 47))
 
     draw_menu()
     if gl_renderer is not None:

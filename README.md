@@ -6,6 +6,7 @@ FluentScope Next is a real-time audio oscilloscope and spectrum analyzer for aud
 - **Spectrum** shows the frequency spectrum and a scrolling waterfall.
 - **Lissajous** plots audio in X/Y mode for inspecting stereo phase relationships.
 - **CRT rendering** adds a beam with adjustable focus, persistence, and bloom to the Scope and Lissajous views.
+- **GL Line rendering** draws plain traces with OpenGL, with adjustable line width and optional anti-aliasing. Spectrum lines use the same renderer whenever OpenGL is active.
 
 ## Screenshots
 
@@ -51,11 +52,13 @@ To update an existing environment, rerun `python -m pip install -r requirements.
 
 `--loopback` captures the default Windows WASAPI output. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. If several capture devices have that exact name, startup stops with a warning and lists selectors such as `"exact:Device Name:1"` and `"exact:Device Name:2"`. The final number is the 1-based occurrence among devices with the same name, in `--list-devices` order (across audio APIs); duplicate entries in that list also show their numbered selectors. Names containing colons are supported; a matching full device name takes precedence over interpreting its final colon as an occurrence suffix. Device indices and occurrence order depend on the audio backend and connected devices; check the list again after upgrading. Loopback uses the output device's native sample rate and channel count; the first two channels are displayed. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
 
-To enable CRT rendering, install ModernGL and use a graphics driver with OpenGL 3.3 core support. SciPy is optional and enables polyphase resampling for the CRT trace.
+To enable the OpenGL renderers (CRT and GL Line), install ModernGL and use a graphics driver with OpenGL 3.3 core support. SciPy is optional and enables polyphase resampling for the CRT trace. `requirements-full.txt` installs the required packages plus all optional ones:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install moderngl scipy
+.\.venv\Scripts\python.exe -m pip install -r requirements-full.txt
 ```
+
+Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygame.
 
 ## Controls
 
@@ -69,7 +72,9 @@ To enable CRT rendering, install ModernGL and use a graphics driver with OpenGL 
 | A / H | Cycle scope gain control or toggle gain peak hold |
 | J / K / D | Toggle the scope grid, fixed-gain dBFS labels, or AGC dBFS labels |
 | L / W / I | Cycle the X/Y mode, swap axes, or change axis inversion |
-| C | Toggle the CRT beam when OpenGL rendering is available |
+| C / Shift+C | Cycle the trace renderer: CRT, GL Line, Pygame (needs OpenGL) |
+| N / Shift+N | Make GL lines (GL Line traces and spectrum lines) thicker or thinner |
+| O | Toggle anti-aliasing of GL lines |
 | T / Shift+T | Cycle themes forward or backward |
 
 The **Time span** control in the F1 menu selects how much audio the Scope shows across its horizontal axis. At 48 kHz the options are 5.33, 10.67, 21.33 (default), 42.67, and 85.33 ms.

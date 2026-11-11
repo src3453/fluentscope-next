@@ -1,0 +1,12 @@
+# Required dependencies plus every optional one.
+-r requirements.txt
+
+# OpenGL rendering: CRT beam and GL Line renderers, anti-aliased spectrum lines
+# (needs a driver with OpenGL 3.3 core support; without it pygame lines are used)
+moderngl
+
+# Polyphase (band-limited) resampling of the CRT trace (linear interpolation without it)
+scipy
+
+# Tkinter (startup device menu) ships with Python and cannot be installed with pip:
+# on Linux install your distribution's package, e.g. python3-tk.

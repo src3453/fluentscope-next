@@ -179,7 +179,9 @@ uniform sampler2D uUI;     // pygame surface, top row first
 uniform sampler2D uHDR;    // accumulated beam light
 uniform sampler2D uBloomNear;
 uniform sampler2D uBloomFar;
+uniform sampler2D uLines;  // premultiplied plain line layer
 uniform int uCRT;
+uniform int uLineLayer;
 uniform vec4 uUIRect; // left, top, right, bottom in UI pixels
 uniform int uInk;          // light background: the beam darkens like ink
 uniform float uExposure;
@@ -206,8 +208,15 @@ void main() {
     vec3 ui = texture(uUI, uiUV).rgb;
     vec2 uiPixel = uiUV * vec2(textureSize(uUI, 0));
 
-    if (uCRT == 0 || (all(greaterThanEqual(uiPixel, uUIRect.xy)) &&
-                     all(lessThan(uiPixel, uUIRect.zw)))) {
+    if (all(greaterThanEqual(uiPixel, uUIRect.xy)) && all(lessThan(uiPixel, uUIRect.zw))) {
+        fragColor = vec4(ui, 1.0); // menu panel: on top of everything
+        return;
+    }
+    if (uLineLayer == 1) {
+        vec4 line = texture(uLines, vUV);
+        ui = ui * (1.0 - line.a) + line.rgb;
+    }
+    if (uCRT == 0) {
         fragColor = vec4(ui, 1.0);
         return;
     }
@@ -239,6 +248,82 @@ void main() {
     fragColor = vec4(color, 1.0);
 }
 """
+
+# Plain (non-CRT) polyline: every segment is a capsule (rounded ends) rendered
+# as an instanced quad. The coverage of each pixel comes from its distance to
+# the segment, so joints and ends are round and the width is free (subpixel).
+# Coverage is merged with MAX blending, so overlapping capsules at the joints
+# do not get darker / brighter like stacked alpha would.
+LINE_VERT = """
+#version 330
+uniform vec2 uViewport;   // framebuffer size in pixels
+uniform float uExtent;    // half width + AA fringe, pixels
+
+in vec4 aSeg;             // x0, y0, x1, y1 (pixels, y down)
+
+out vec3 vUVL;            // segment-local x, y and segment length
+
+void main() {
+    int id = gl_VertexID & 3;
+
+    vec2 p0 = aSeg.xy;
+    vec2 p1 = aSeg.zw;
+    vec2 d = p1 - p0;
+    float len = length(d);
+    vec2 dir = len > 1e-5 ? d / len : vec2(1.0, 0.0);
+    vec2 nrm = vec2(-dir.y, dir.x);
+
+    float r = uExtent;
+    float side = (id & 1) == 0 ? -1.0 : 1.0;
+    bool at_end = id >= 2;
+
+    vec2 p = (at_end ? p1 + dir * r : p0 - dir * r) + nrm * (side * r);
+    vUVL = vec3(at_end ? len + r : -r, side * r, len);
+
+    vec2 ndc = p / uViewport * 2.0 - 1.0;
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+}
+"""
+
+LINE_FRAG = """
+#version 330
+uniform float uWidth;     // line width in pixels
+uniform int uAA;
+
+in vec3 vUVL;
+out vec4 fragColor;
+
+void main() {
+    float x = vUVL.x;
+    float dist = length(vec2(x - clamp(x, 0.0, vUVL.z), vUVL.y));
+    float cov;
+    if (uAA == 1) {
+        // lines thinner than a pixel get a 1px footprint with reduced coverage
+        float half_w = max(uWidth, 1.0) * 0.5;
+        cov = clamp(half_w + 0.5 - dist, 0.0, 1.0) * min(uWidth, 1.0);
+    } else {
+        cov = dist <= max(uWidth, 1.0) * 0.5 ? 1.0 : 0.0;
+    }
+    if (cov <= 0.0) {
+        discard;
+    }
+    fragColor = vec4(cov);
+}
+"""
+
+# coverage (R) x color -> premultiplied RGBA, blended "over" into the line layer
+LINE_RESOLVE_FRAG = """
+#version 330
+uniform sampler2D uCoverage;
+uniform vec3 uColor;
+in vec2 vUV;
+out vec4 fragColor;
+void main() {
+    float a = texture(uCoverage, vUV).r;
+    fragColor = vec4(uColor * a, a);
+}
+"""
+
 
 
 # ==========================
@@ -280,6 +365,9 @@ class CRTRenderer:
         if crt:
             renderer.begin_frame(dt)
             renderer.draw_beam(points, energy, color)   # any number of times
+        if plain lines:
+            renderer.begin_lines()
+            renderer.draw_line(points, color)           # any number of times
         renderer.present(crt)
     """
 
@@ -350,6 +438,27 @@ class CRTRenderer:
         self.ui_tex = ctx.texture((width, height), 4)
         self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
+        # plain line renderer (non-CRT)
+        self.line_width = 2.0       # px
+        self.line_aa = True
+        self.line_prog = ctx.program(vertex_shader=LINE_VERT, fragment_shader=LINE_FRAG)
+        self.line_resolve_prog = ctx.program(
+            vertex_shader=FULLSCREEN_VERT, fragment_shader=LINE_RESOLVE_FRAG
+        )
+        self.line_resolve_vao = ctx.vertex_array(self.line_resolve_prog, [])
+        self.line_seg_capacity = 0
+        self.line_seg_buffer = None
+        self.line_vao = None
+        self._ensure_line_capacity(16384)
+
+        self.coverage_tex = ctx.texture((width, height), 1)
+        self.coverage_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.coverage_fbo = ctx.framebuffer(color_attachments=[self.coverage_tex])
+        self.line_tex = ctx.texture((width, height), 4)
+        self.line_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self.line_fbo = ctx.framebuffer(color_attachments=[self.line_tex])
+        self.line_layer = False     # begin_lines() was called this frame
+
         self.clear()
 
     # ---------- resources ----------
@@ -366,6 +475,19 @@ class CRTRenderer:
             self.beam_prog, [(self.seg_buffer, "4f 1f /i", "aSeg", "aEnergy")]
         )
         self.seg_capacity = capacity
+
+    def _ensure_line_capacity(self, segments: int):
+        if segments <= self.line_seg_capacity:
+            return
+        capacity = max(segments, self.line_seg_capacity * 2)
+        if self.line_vao is not None:
+            self.line_vao.release()
+            self.line_seg_buffer.release()
+        self.line_seg_buffer = self.ctx.buffer(reserve=capacity * 4 * 4, dynamic=True)
+        self.line_vao = self.ctx.vertex_array(
+            self.line_prog, [(self.line_seg_buffer, "4f /i", "aSeg")]
+        )
+        self.line_seg_capacity = capacity
 
     def clear(self):
         """Erase the phosphor (view change etc.)."""
@@ -465,6 +587,70 @@ class CRTRenderer:
         self.beam_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
         self.hdr_fbo.scissor = None
 
+    # ---------- plain lines ----------
+
+    def begin_lines(self):
+        """
+        Start a new line layer (lines are not kept between frames). The next
+        present() lays it over the UI, under the CRT beam.
+        """
+        self.line_fbo.scissor = None
+        self.line_fbo.clear(0.0, 0.0, 0.0, 0.0)
+        self.line_layer = True
+
+    def draw_line(self, points, color, scissor=None, width=None):
+        """
+        Polyline with self.line_aa into the line layer (begin_lines() first).
+        points: (N, 2) window pixels (y down). color: (r, g, b) 0..1.
+        scissor: optional (left, top, width, height) clip rectangle.
+        width: pixels, default self.line_width.
+        """
+
+        points = np.asarray(points, dtype=np.float32)
+        n = len(points) - 1
+        if n <= 0:
+            return
+
+        segments = np.empty((n, 4), dtype=np.float32)
+        segments[:, 0:2] = points[:-1]
+        segments[:, 2:4] = points[1:]
+        self._ensure_line_capacity(n)
+        self.line_seg_buffer.write(segments.tobytes())
+
+        width = max(float(self.line_width if width is None else width), 0.05)
+        prog = self.line_prog
+        prog["uViewport"].value = (self.width, self.height)
+        prog["uWidth"].value = width
+        prog["uAA"].value = 1 if self.line_aa else 0
+        prog["uExtent"].value = max(width, 1.0) * 0.5 + 1.0
+
+        rect = None
+        if scissor is not None:
+            left, top, w, h = scissor
+            rect = (int(left), int(self.height - top - h), int(w), int(h))
+
+        # 1) coverage of the whole polyline, merged with MAX
+        self.coverage_fbo.use()
+        self.coverage_fbo.scissor = None
+        self.coverage_fbo.clear(0.0)
+        self.coverage_fbo.scissor = rect
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = moderngl.ONE, moderngl.ONE
+        self.ctx.blend_equation = moderngl.MAX
+        self.line_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
+        self.ctx.blend_equation = moderngl.FUNC_ADD
+        self.coverage_fbo.scissor = None
+
+        # 2) tint and lay it over the earlier lines (premultiplied "over")
+        self.line_fbo.use()
+        self.line_fbo.scissor = rect
+        self.ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
+        self.coverage_tex.use(0)
+        self.line_resolve_prog["uCoverage"].value = 0
+        self.line_resolve_prog["uColor"].value = tuple(color)
+        self.line_resolve_vao.render(moderngl.TRIANGLES, vertices=3)
+        self.line_fbo.scissor = None
+
     # ---------- output ----------
 
     def _bloom(self):
@@ -485,7 +671,10 @@ class CRTRenderer:
             src = tex_a
 
     def present(self, crt: bool, target=None, *, ui_rect=None):
-        """Composite the UI (and the beam if crt) into `target` (default: the window)."""
+        """
+        Composite the UI, the line layer (if begin_lines() was called this frame)
+        and the beam (if crt) into `target` (default: the window).
+        """
 
         if crt and self.bloom:
             self._bloom()
@@ -498,13 +687,17 @@ class CRTRenderer:
         self.hdr_tex.use(1)
         self.bloom_levels[0][0][0].use(2)
         self.bloom_levels[1][0][0].use(3)
+        self.line_tex.use(4)
 
         prog = self.comp_prog
         prog["uUI"].value = 0
         prog["uHDR"].value = 1
         prog["uBloomNear"].value = 2
         prog["uBloomFar"].value = 3
+        prog["uLines"].value = 4
         prog["uCRT"].value = 1 if crt else 0
+        prog["uLineLayer"].value = 1 if self.line_layer else 0
+        self.line_layer = False
         if ui_rect is None:
             prog["uUIRect"].value = (0, 0, 0, 0)
         else:
