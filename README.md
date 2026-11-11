@@ -89,6 +89,7 @@ Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygam
 | F1 | Open the controls menu (works even when the menu button is hidden) |
 | F2 | Show or hide the level meter |
 | F3 | Show or hide the status text and menu button |
+| F4 | Reset the window to its default size (1000x600) |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
 | R / M | Cycle the trigger or stereo mode |

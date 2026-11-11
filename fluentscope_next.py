@@ -4,7 +4,9 @@ import os
 import sys
 import threading
 
-from window_support import configure_windowing, focus_window, ui_font
+from window_support import (
+    configure_windowing, focus_window, resize_window, set_minimum_window_size, ui_font,
+)
 
 configure_windowing()
 
@@ -175,8 +177,10 @@ METER_CLIP_COLOR = (255, 50, 50)
 # Display Settings
 # ==========================
 
-WIDTH = 1000
+WIDTH = 1000 # initial window size; the window is resizable and remembers its last size
 HEIGHT = 600
+MIN_WIDTH = 640 # smallest window the layout (menu, status text, meter) is designed for
+MIN_HEIGHT = 480
 SCOPE_GAIN = 0.9
 SCOPE_AGC_MAX_BOOST = 32.0
 SCOPE_AGC_SILENCE = 0.0001
@@ -1296,6 +1300,17 @@ class Waterfall:
             self.history[self.head] = levels
             self.surface.blit(self.row_surface, (0, r))
 
+    def resized(self, width, height):
+        """A copy at another size: columns resampled, newest rows kept."""
+        new = Waterfall(width, height)
+        order = (self.head - np.arange(self.height)) % self.height
+        # columns are log-frequency positions, so a nearest-column resample keeps them aligned
+        columns = np.minimum((np.arange(width) * self.width) // width, self.width - 1)
+        rows = min(height, self.height)
+        new.history[(-np.arange(rows)) % height] = self.history[order[:rows]][:, columns]
+        new.pending_rows = self.pending_rows
+        return new
+
     def rerender(self, lut):
         order = (self.head - np.arange(self.height)) % self.height
         image = lut[self.history[order]]  # (h, w, 3)
@@ -1422,10 +1437,50 @@ def recover_audio_stream():
 stream.start_stream()
 
 # ==========================
+# Persistent Settings
+# ==========================
+
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fluentscope_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"Warning: failed to load settings ({exc})")
+        return {}
+
+
+saved_settings = load_settings()
+
+
+# ==========================
 # Pygame
 # ==========================
 
 pygame.init()
+
+
+def initial_window_size():
+    """The last window size from the settings, kept on the desktop and above the minimum."""
+    width, height = WIDTH, HEIGHT
+    size = saved_settings.get("window_size")
+    if isinstance(size, list) and len(size) == 2 and all(type(v) is int and v > 0 for v in size):
+        width, height = size
+    try:
+        desktop_w, desktop_h = pygame.display.get_desktop_sizes()[0]
+        width, height = min(width, desktop_w), min(height, desktop_h)
+    except Exception:
+        pass
+    return max(width, MIN_WIDTH), max(height, MIN_HEIGHT)
+
+
+DEFAULT_WINDOW_SIZE = (WIDTH, HEIGHT) # [F4] / the menu button goes back to this
+WIDTH, HEIGHT = initial_window_size()
 
 # Load fonts before showing a window so its event loop can start immediately.
 font = ui_font(18)
@@ -1450,7 +1505,8 @@ def open_gl_window():
                                             pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG)
         pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
         pygame.display.set_mode(
-            (WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF, vsync=1 if VSYNC else 0
+            (WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE,
+            vsync=1 if VSYNC else 0,
         )
         renderer = CRTRenderer(moderngl.create_context(), WIDTH, HEIGHT)
     except Exception as exc:
@@ -1469,10 +1525,11 @@ if gl_window is not None:
     # text, labels and the menu: composited above the GL lines and the CRT beam
     overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
 else:
-    screen = pygame.display.set_mode((WIDTH, HEIGHT), vsync=1 if VSYNC else 0)
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
     overlay = screen # pygame draws everything in order: text is drawn last anyway
 
 pygame.display.set_caption("FluentScope Next")
+set_minimum_window_size(MIN_WIDTH, MIN_HEIGHT)
 
 clock = pygame.time.Clock()
 
@@ -1532,54 +1589,83 @@ lissajous_beam_end = None # absolute sample index the Lissajous beam has been dr
 show_level_meter = SHOW_LEVEL_METER
 show_hud = SHOW_HUD # status text + menu button ([F1] opens the menu either way)
 
-SPLIT_Y = HEIGHT // 2
+SPLIT_Y = None
 PLOT_WIDTH = None
+overlay_height = overlay_top = None
 analyzer = None
 waterfall = None
-MENU_BUTTON = MENU_PANEL = None
+MENU_BUTTON = None
+hud_bottom = 0 # lowest pixel row of the status text (0 while it is hidden)
+
+MENU_COLUMN_WIDTH = 209
+MENU_COLUMN_GAP = 8
+MENU_ROW_HEIGHT = 21
+MENU_PADDING = 10
+MENU_HINT = "Shift reverses supported controls or changes XY delay by x2 / x0.5."
 
 
 def layout_menu():
-    global MENU_BUTTON, MENU_PANEL
+    global MENU_BUTTON
     MENU_BUTTON = pygame.Rect(PLOT_WIDTH - 122, 6, 112, 24)
-    # the panel sits under the button, or at the top when the button is hidden
-    MENU_PANEL = pygame.Rect(PLOT_WIDTH - 894, 36 if show_hud else 6, 884, 232)
 
 
-def set_plot_width():
+def update_layout():
     """
-    Plot area = window minus the level meter panel on the right. Rebuilds everything
-    sized to it; the waterfall history is resampled so it survives a meter toggle.
+    Lay everything out for the current window size: plot area = window minus the
+    level meter panel on the right. Rebuilds what is sized to it; the waterfall
+    history is resampled so it survives a meter toggle or a window resize.
     """
-    global PLOT_WIDTH, analyzer, waterfall, crt_scene
-    width = WIDTH - (METER_PANEL_WIDTH if show_level_meter else 0)
-    if width == PLOT_WIDTH:
-        return
-    PLOT_WIDTH = width
-    analyzer = SpectrumAnalyzer(
-        FFT_SIZE, RATE, PLOT_WIDTH,
-        SPEC_F_MIN, SPEC_F_MAX,
-        SPEC_DB_MIN, SPEC_DB_MAX,
+    global PLOT_WIDTH, SPLIT_Y, overlay_height, overlay_top, analyzer, waterfall, crt_scene
+    width = max(1, WIDTH - (METER_PANEL_WIDTH if show_level_meter else 0))
+    split_y = HEIGHT // 2
+    overlay_height = int(HEIGHT * SPEC_OVERLAY_RATIO)
+    overlay_top = HEIGHT - overlay_height
+    waterfall_size = (width, HEIGHT - split_y)
+    changed = (width, split_y) != (PLOT_WIDTH, SPLIT_Y) or (
+        waterfall is not None and (waterfall.width, waterfall.height) != waterfall_size
     )
-    old = waterfall
-    waterfall = Waterfall(PLOT_WIDTH, HEIGHT - SPLIT_Y)
-    if old is not None:
-        # columns are log-frequency positions, so a nearest-column resample keeps them aligned
-        columns = np.minimum((np.arange(PLOT_WIDTH) * old.width) // PLOT_WIDTH, old.width - 1)
-        waterfall.history[:] = old.history[:, columns]
-        waterfall.head = old.head
-        waterfall.pending_rows = old.pending_rows
-    waterfall.rerender(theme["lut"])
-    crt_scene = None # the phosphor was drawn for the old width
+    PLOT_WIDTH, SPLIT_Y = width, split_y
     layout_menu()
+    if not changed:
+        return
+    if analyzer is None or analyzer.width != PLOT_WIDTH:
+        analyzer = SpectrumAnalyzer(
+            FFT_SIZE, RATE, PLOT_WIDTH,
+            SPEC_F_MIN, SPEC_F_MAX,
+            SPEC_DB_MIN, SPEC_DB_MAX,
+        )
+    waterfall = Waterfall(*waterfall_size) if waterfall is None else waterfall.resized(*waterfall_size)
+    waterfall.rerender(theme["lut"])
+    crt_scene = None # the phosphor was drawn for the old layout
 
 
-set_plot_width()
+def apply_window_size(width, height):
+    """Follow a window resize: new drawing surfaces, GL render targets and layout."""
+    global WIDTH, HEIGHT, screen, overlay
+    width, height = max(1, int(width)), max(1, int(height))
+    if (width, height) == (WIDTH, HEIGHT):
+        return
+    WIDTH, HEIGHT = width, height
+    if gl_renderer is not None:
+        screen = pygame.Surface((WIDTH, HEIGHT), 0, 32)
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
+        gl_renderer.resize(WIDTH, HEIGHT)
+    else:
+        screen = pygame.display.get_surface()
+        if screen is None or screen.get_size() != (WIDTH, HEIGHT):
+            screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
+        overlay = screen
+    update_layout()
+
+
+def content_top():
+    """First pixel row below the status text (views keep their labels / plots under it)."""
+    return max(LISSAJOUS_TOP, hud_bottom + 4) if show_hud else LISSAJOUS_TOP
+
+
+update_layout()
 
 meter = LevelMeter(2)
-
-overlay_height = int(HEIGHT * SPEC_OVERLAY_RATIO)
-overlay_top = HEIGHT - overlay_height
 
 
 def set_theme(index):
@@ -1589,26 +1675,6 @@ def set_theme(index):
     waterfall.rerender(theme["lut"])
 
 
-# ==========================
-# Persistent Settings
-# ==========================
-
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fluentscope_settings.json")
-
-
-def load_settings():
-    try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        print(f"Warning: failed to load settings ({exc})")
-        return {}
-
-
-saved_settings = load_settings()
 
 
 def apply_settings(data):
@@ -1717,6 +1783,7 @@ def current_settings():
         "lissajous_swap": lissajous_swap,
         "lissajous_invert": lissajous_invert,
         "theme": theme["name"],
+        "window_size": [WIDTH, HEIGHT],
     })
     if gl_renderer is not None:
         data.pop("crt_enabled", None) # superseded by trace_renderer
@@ -1749,8 +1816,7 @@ def save_settings_if_changed():
 
 
 apply_settings(saved_settings)
-set_plot_width() # the saved meter visibility may change the plot width
-layout_menu()
+update_layout() # the saved meter visibility may change the plot width
 
 
 def draw_trace(waveform, color, top, height):
@@ -1861,9 +1927,9 @@ def draw_scope(traces):
         for i, (name, color) in enumerate((("L", theme["trace_l"]), ("R", theme["trace_r"]))):
             label = font.render(name, True, color)
             if stereo_mode == "Split":
-                pos = (PLOT_WIDTH - label.get_width() - 8, i * SPLIT_Y + (8 if i else 64))
+                pos = (PLOT_WIDTH - label.get_width() - 8, i * SPLIT_Y + (8 if i else content_top()))
             else:
-                pos = (PLOT_WIDTH - 24 * (2 - i) - 4, 64)
+                pos = (PLOT_WIDTH - 24 * (2 - i) - 4, content_top())
             overlay.blit(label, pos)
 
 
@@ -1893,9 +1959,10 @@ def orient_lissajous(x, y):
 
 def lissajous_rect():
     """Square plot area (left, top, side), centered in the plot width."""
-    side = min(PLOT_WIDTH - 16, HEIGHT - LISSAJOUS_TOP - 8)
+    top = content_top()
+    side = max(1, min(PLOT_WIDTH - 16, HEIGHT - top - 8))
     left = (PLOT_WIDTH - side) // 2
-    return left, LISSAJOUS_TOP, side
+    return left, top, side
 
 
 def build_lissajous_points(left, right, mix, round_pixels=True):
@@ -2195,6 +2262,7 @@ def menu_items():
             (pygame.K_m, "M", f"Stereo: {stereo_mode}"),
             (pygame.K_F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
             (pygame.K_F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
+            (pygame.K_F4, "F4", "Reset size ({}x{})".format(*DEFAULT_WINDOW_SIZE)),
         )),
         ("Scope", (
             (pygame.K_x, "X", f"Time span: {scope_time_span()}"),
@@ -2231,8 +2299,63 @@ def menu_items():
     return groups
 
 
-def menu_row(column, row):
-    return pygame.Rect(MENU_PANEL.x + 10 + 217 * column, MENU_PANEL.y + 32 + 21 * row, 209, 20)
+def wrap_words(text, text_font, max_width, separator=" "):
+    """Greedy wrap at `separator` so every line fits max_width (a single piece may not)."""
+    lines, current = [], ""
+    for piece in text.split(separator):
+        candidate = piece if not current else current + separator + piece
+        if current and text_font.size(candidate)[0] > max_width:
+            lines.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
+def menu_layout():
+    """
+    Place the menu groups for the current window: as many columns as fit, the
+    rest wrapped into further bands below. Returns (panel rect, titles, rows,
+    hint lines) with titles = [(text, (x, y))] and rows = [(key, label, rect)].
+    """
+    groups = menu_items()
+    available = WIDTH - 2 * MENU_PADDING # the panel may cover the level meter
+    step = MENU_COLUMN_WIDTH + MENU_COLUMN_GAP
+    columns = max(1, min(len(groups), (available - 2 * MENU_PADDING + MENU_COLUMN_GAP) // step))
+    column_width = min(MENU_COLUMN_WIDTH, available - 2 * MENU_PADDING)
+    width = 2 * MENU_PADDING + columns * (column_width + MENU_COLUMN_GAP) - MENU_COLUMN_GAP
+    hint = wrap_words(MENU_HINT, small_font, width - 2 * MENU_PADDING)
+
+    # right-aligned to the plot like the button, shifted left only as far as needed
+    left = min(max(MENU_PADDING, PLOT_WIDTH - MENU_PADDING - width), WIDTH - MENU_PADDING - width)
+    top = 36 if show_hud else 6
+
+    titles, rows = [], []
+    y = top
+    for band in range(0, len(groups), columns):
+        band_groups = groups[band:band + columns]
+        for column, (title, items) in enumerate(band_groups):
+            x = left + MENU_PADDING + column * (column_width + MENU_COLUMN_GAP)
+            titles.append((title, (x + 4, y + 7)))
+            for row, (key, shortcut, text) in enumerate(items):
+                rect = pygame.Rect(x, y + 32 + MENU_ROW_HEIGHT * row, column_width, MENU_ROW_HEIGHT - 1)
+                rows.append((key, f"[{shortcut}] {text}", rect))
+        y += 32 + MENU_ROW_HEIGHT * max(len(items) for _, items in band_groups) + 4
+    height = y - top + 12 + small_font.get_linesize() * len(hint)
+    # a window too short for the whole panel cuts it off (rows below stay unreachable)
+    panel = pygame.Rect(left, top, width, max(1, min(height, HEIGHT - top - 4)))
+    rows = [row for row in rows if panel.contains(row[2])]
+    return panel, titles, rows, hint
+
+
+def menu_key_at(pos):
+    """(clicked inside the panel, menu key under pos or None)."""
+    panel, _, rows, _ = menu_layout()
+    if not panel.collidepoint(pos):
+        return False, None
+    return True, next((key for key, _, rect in rows if rect.collidepoint(pos)), None)
 
 
 def draw_button(rect, text):
@@ -2248,20 +2371,110 @@ def draw_menu():
     if not menu_open:
         return
 
-    pygame.draw.rect(overlay, theme["bg"], MENU_PANEL)
-    pygame.draw.rect(overlay, theme["center"], MENU_PANEL, 1)
+    panel, titles, rows, hint = menu_layout()
+    pygame.draw.rect(overlay, theme["bg"], panel)
+    overlay.set_clip(panel)
     pointer = pygame.mouse.get_pos()
-    for column, (title, items) in enumerate(menu_items()):
-        x = menu_row(column, 0).x
-        overlay.blit(font.render(title, True, theme["text"]), (x + 4, MENU_PANEL.y + 7))
-        for row, (_, shortcut, text) in enumerate(items):
-            rect = menu_row(column, row)
-            if rect.collidepoint(pointer):
-                pygame.draw.rect(overlay, theme["grid"], rect)
-            label = small_font.render(f"[{shortcut}] {text}", True, theme["text"])
-            overlay.blit(label, (rect.x + 4, rect.y + 2))
-    hint = "Shift reverses supported controls or changes XY delay by x2 / x0.5."
-    overlay.blit(small_font.render(hint, True, theme["text"]), (MENU_PANEL.x + 14, MENU_PANEL.bottom - 22))
+    for title, pos in titles:
+        overlay.blit(font.render(title, True, theme["text"]), pos)
+    for _, label, rect in rows:
+        if rect.collidepoint(pointer):
+            pygame.draw.rect(overlay, theme["grid"], rect)
+        overlay.blit(small_font.render(label, True, theme["text"]), (rect.x + 4, rect.y + 2))
+    line_height = small_font.get_linesize()
+    y = panel.bottom - 8 - line_height * len(hint)
+    for line in hint:
+        overlay.blit(small_font.render(line, True, theme["text"]), (panel.x + 14, y))
+        y += line_height
+    overlay.set_clip(None)
+    pygame.draw.rect(overlay, theme["center"], panel, 1)
+
+
+def hud_texts(detected_period):
+    """Status lines, top to bottom, as (font, text); fields are separated by 3 spaces."""
+    texts = [(font, f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}")]
+
+    if trigger_mode in ("FFT", "Hybrid", "Corr"):
+        trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
+    else:
+        trigger_info = trigger_mode
+
+    stereo_info = stereo_mode if input_channels >= 2 else f"{stereo_mode} (mono in)"
+
+    if view == VIEW_LISSAJOUS:
+        if effective_lissajous_mode() == "Auto":
+            mono = " (mono in)" if input_channels == 1 else ""
+            liss_info = f"Auto{mono}   Delay:{lissajous_delay} ({lissajous_delay / RATE * 1000:.2f}ms)"
+        else:
+            liss_info = "L/R"
+        help_text = (
+            f"View:{VIEW_NAMES[view]}   Theme:{theme['name']}   Lissajous:{liss_info}"
+            f"   Swap:{'ON' if lissajous_swap else 'OFF'}   Invert:{lissajous_invert}"
+        )
+    else:
+        help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
+        if view == VIEW_SCOPE:
+            help_text += f"   Time span: {scope_time_span()}"
+    texts.append((small_font, help_text))
+
+    if gl_renderer is not None:
+        if trace_renderer == "CRT":
+            renderer_text = (
+                f"Renderer:CRT   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
+                f"   Afterglow:{format_seconds(crt_persistence)}   Bloom:{'ON' if crt_bloom else 'OFF'}"
+                f"   Gamma:{crt_gamma:.1f}{' (ink: 1.0)' if theme_is_light() else ''}"
+                f"   Line:{format_line_width(line_width)} AA:{'ON' if line_aa else 'OFF'}"
+            )
+        elif trace_renderer == "GL Line":
+            renderer_text = (
+                f"Renderer:GL Line   Width:{format_line_width(line_width)}"
+                f"   AA:{'ON' if line_aa else 'OFF'}"
+            )
+        else:
+            renderer_text = "Renderer:Pygame"
+        texts.append((small_font, renderer_text))
+
+    if view == VIEW_SCOPE:
+        agc_status = scope_agc_mode
+        if scope_agc_mode != "Off":
+            agc_status += f" x{scope_gain / SCOPE_GAIN:.2f}"
+        hold_status = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "OFF"
+        scale_status = "   ".join(
+            f"{name}:{'On' if enabled else 'Off'}" for _, _, name, enabled in scale_controls()
+        )
+        texts.append((small_font, (
+            f"AGC:{agc_status}   Peak hold:{hold_status}   {scale_status}"
+            f"   Line:{'Step' if line_is_step else 'Smooth'}"
+        )))
+    return texts
+
+
+def layout_hud(texts):
+    """
+    Stack the status lines from the top left, each wrapped at its field
+    separators to the plot width (the first line also keeps clear of the menu
+    button). Returns [(font, text, (x, y))].
+    """
+    lines = []
+    y = 10
+    for index, (text_font, text) in enumerate(texts):
+        right = MENU_BUTTON.x - 10 if index == 0 else PLOT_WIDTH - 10
+        for line in wrap_words(text, text_font, right - 10, separator="   "):
+            lines.append((text_font, line, (10, y)))
+            y += text_font.get_linesize() if index == 0 else 15
+        if index == 0:
+            y = max(y, 32)
+    return lines
+
+
+def reset_window_size():
+    """Back to DEFAULT_WINDOW_SIZE (un-maximizes first)."""
+    if gl_renderer is None:
+        # a plain window can simply be recreated at the new size
+        pygame.display.set_mode(DEFAULT_WINDOW_SIZE, pygame.RESIZABLE, vsync=1 if VSYNC else 0)
+    elif not resize_window(*DEFAULT_WINDOW_SIZE):
+        return # would need a new GL context; leave the window as it is
+    apply_window_size(*pygame.display.get_window_size())
 
 
 # ==========================
@@ -2276,7 +2489,7 @@ print(r"""     ______              __  ____
   ~ Completely Rewritten ~
   (c) 2026 src3453 Released under The MIT License.""")
 print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
-print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button")
+print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button  [F4] Reset window size")
 print("        [A] Scope AGC Off/High/Med/Low  [D] AGC dBFS labels  [H] AGC peak hold")
 print("        [J] Scope grid  [K] Fixed-gain dBFS labels")
 print("        [X]/[Shift+X] Scope time span  [P] Scope step / smooth line")
@@ -2293,7 +2506,13 @@ focus_window()
 
 while running:
 
+    window_resized = False
+
     for event in pygame.event.get():
+
+        if event.type in (pygame.VIDEORESIZE, pygame.WINDOWSIZECHANGED):
+            window_resized = True
+            continue
 
         if event.type == pygame.WINDOWTAKEFOCUS:
             focus_window()
@@ -2307,13 +2526,9 @@ while running:
                 menu_open = not menu_open
                 continue
             if menu_open:
-                key = next((
-                    key for column, (_, items) in enumerate(menu_items())
-                    for row, (key, _, _) in enumerate(items)
-                    if menu_row(column, row).collidepoint(event.pos)
-                ), None)
+                inside, key = menu_key_at(event.pos)
                 if key is None:
-                    if not MENU_PANEL.collidepoint(event.pos):
+                    if not inside:
                         menu_open = False
                     continue
                 event = pygame.event.Event(pygame.KEYDOWN, key=key, mod=pygame.key.get_mods())
@@ -2331,10 +2546,12 @@ while running:
                 continue
             elif event.key == pygame.K_F2:
                 show_level_meter = not show_level_meter
-                set_plot_width()
+                update_layout()
             elif event.key == pygame.K_F3:
                 show_hud = not show_hud
                 layout_menu()
+            elif event.key == pygame.K_F4:
+                reset_window_size()
             elif event.key == pygame.K_TAB:
                 view = (view + 1) % len(VIEW_NAMES)
             elif event.key == pygame.K_1:
@@ -2418,6 +2635,10 @@ while running:
 
             save_settings_if_changed() # auto-save whenever a key changed a setting
 
+    if window_resized:
+        apply_window_size(*pygame.display.get_window_size())
+        save_settings_if_changed() # remember the window size
+
     if not stream.is_active():
         recover_audio_stream()
 
@@ -2470,6 +2691,9 @@ while running:
         scope_gain = SCOPE_GAIN
         scope_held_peak, scope_hold_remaining = 0.0, 0.0
 
+    hud_lines = layout_hud(hud_texts(detected_period)) if show_hud else []
+    hud_bottom = max((pos[1] + text_font.get_height() for text_font, _, pos in hud_lines), default=0)
+
     if view == VIEW_SCOPE:
         draw_scope(traces)
     elif view == VIEW_LISSAJOUS:
@@ -2488,71 +2712,8 @@ while running:
     # Text
     #
 
-    if show_hud:
-        info = font.render(
-            f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   VSYNC:{'ON' if VSYNC else 'OFF'}",
-            True,
-            theme["text"]
-        )
-
-        overlay.blit(info, (10, 10))
-
-        if trigger_mode in ("FFT", "Hybrid", "Corr"):
-            trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
-        else:
-            trigger_info = trigger_mode
-
-        stereo_info = stereo_mode if input_channels >= 2 else f"{stereo_mode} (mono in)"
-
-        if view == VIEW_LISSAJOUS:
-            if effective_lissajous_mode() == "Auto":
-                mono = " (mono in)" if input_channels == 1 else ""
-                liss_info = f"Auto{mono}   Delay:{lissajous_delay} ({lissajous_delay / RATE * 1000:.2f}ms)"
-            else:
-                liss_info = "L/R"
-            help_text = (
-                f"View:{VIEW_NAMES[view]}   Theme:{theme['name']}   Lissajous:{liss_info}"
-                f"   Swap:{'ON' if lissajous_swap else 'OFF'}   Invert:{lissajous_invert}"
-            )
-        else:
-            help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
-            if view == VIEW_SCOPE:
-                help_text += f"   Time span: {scope_time_span()}"
-
-        keys_help = small_font.render(help_text, True, theme["text"])
-
-        overlay.blit(keys_help, (10, 32))
-
-        if view == VIEW_SCOPE:
-            agc_status = scope_agc_mode
-            if scope_agc_mode != "Off":
-                agc_status += f" x{scope_gain / SCOPE_GAIN:.2f}"
-            hold_status = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "OFF"
-            scale_status = "   ".join(
-                f"{name}:{'On' if enabled else 'Off'}" for _, _, name, enabled in scale_controls()
-            )
-            agc_text = (
-                f"AGC:{agc_status}   Peak hold:{hold_status}   {scale_status}"
-                f"   Line:{'Step' if line_is_step else 'Smooth'}"
-            )
-            overlay.blit(small_font.render(agc_text, True, theme["text"]), (10, 62))
-
-        if gl_renderer is not None:
-            if trace_renderer == "CRT":
-                renderer_text = (
-                    f"Renderer:CRT   Exposure:{crt_exposure:.2f}   Focus:{crt_beam_width:.1f}px"
-                    f"   Afterglow:{format_seconds(crt_persistence)}   Bloom:{'ON' if crt_bloom else 'OFF'}"
-                    f"   Gamma:{crt_gamma:.1f}{' (ink: 1.0)' if theme_is_light() else ''}"
-                    f"   Line:{format_line_width(line_width)} AA:{'ON' if line_aa else 'OFF'}"
-                )
-            elif trace_renderer == "GL Line":
-                renderer_text = (
-                    f"Renderer:GL Line   Width:{format_line_width(line_width)}"
-                    f"   AA:{'ON' if line_aa else 'OFF'}"
-                )
-            else:
-                renderer_text = "Renderer:Pygame"
-            overlay.blit(small_font.render(renderer_text, True, theme["text"]), (10, 47))
+    for text_font, text, pos in hud_lines:
+        overlay.blit(text_font.render(text, True, theme["text"]), pos)
 
     draw_menu()
     if gl_renderer is not None:

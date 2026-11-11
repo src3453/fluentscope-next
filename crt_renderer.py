@@ -421,36 +421,6 @@ class CRTRenderer:
         self.beam_vao = None
         self._ensure_capacity(16384)
 
-        # phosphor: 32-bit float so tiny per-frame deposits with long persistence
-        # are not lost to rounding (fall back to half floats if not renderable)
-        self.hdr_tex = None
-        for dtype in ("f4", "f2"):
-            try:
-                tex = ctx.texture((width, height), 4, dtype=dtype)
-                fbo = ctx.framebuffer(color_attachments=[tex])
-                self.hdr_tex, self.hdr_fbo = tex, fbo
-                break
-            except Exception:
-                continue
-        if self.hdr_tex is None:
-            raise RuntimeError("no float render target available")
-        self.hdr_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-
-        self.bloom_levels = []
-        for div in (2, 4):
-            size = (max(1, width // div), max(1, height // div))
-            pair = []
-            for _ in range(2):
-                tex = ctx.texture(size, 4, dtype="f2")
-                tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
-                tex.repeat_x = tex.repeat_y = False
-                pair.append((tex, ctx.framebuffer(color_attachments=[tex])))
-            self.bloom_levels.append(pair)
-
-        self.ui_tex = ctx.texture((width, height), 4)
-        self.ui_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.overlay_tex = ctx.texture((width, height), 4)
-        self.overlay_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.overlay = False        # upload_overlay() was called this frame
 
         # plain line renderer (non-CRT)
@@ -466,17 +436,73 @@ class CRTRenderer:
         self.line_vao = None
         self._ensure_line_capacity(16384)
 
-        self.coverage_tex = ctx.texture((width, height), 1)
-        self.coverage_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.coverage_fbo = ctx.framebuffer(color_attachments=[self.coverage_tex])
-        self.line_tex = ctx.texture((width, height), 4)
-        self.line_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
-        self.line_fbo = ctx.framebuffer(color_attachments=[self.line_tex])
+        self._targets = []
+        self._create_targets()
         self.line_layer = False     # begin_lines() was called this frame
 
         self.clear()
 
     # ---------- resources ----------
+
+    def _target(self, size, components, dtype="f1", linear=False):
+        tex = self.ctx.texture(size, components, dtype=dtype)
+        tex.filter = (moderngl.LINEAR, moderngl.LINEAR) if linear else (moderngl.NEAREST, moderngl.NEAREST)
+        self._targets.append(tex)
+        return tex
+
+    def _framebuffer(self, tex):
+        fbo = self.ctx.framebuffer(color_attachments=[tex])
+        self._targets.append(fbo)
+        return fbo
+
+    def _create_targets(self):
+        """Everything sized to the window: phosphor, bloom, UI layers, line layer."""
+        size = (self.width, self.height)
+
+        # phosphor: 32-bit float so tiny per-frame deposits with long persistence
+        # are not lost to rounding (fall back to half floats if not renderable)
+        self.hdr_tex = None
+        for dtype in ("f4", "f2"):
+            try:
+                tex = self.ctx.texture(size, 4, dtype=dtype)
+                fbo = self.ctx.framebuffer(color_attachments=[tex])
+            except Exception:
+                continue
+            tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.hdr_tex, self.hdr_fbo = tex, fbo
+            self._targets += [tex, fbo]
+            break
+        if self.hdr_tex is None:
+            raise RuntimeError("no float render target available")
+
+        self.bloom_levels = []
+        for div in (2, 4):
+            level_size = (max(1, self.width // div), max(1, self.height // div))
+            pair = []
+            for _ in range(2):
+                tex = self._target(level_size, 4, "f2", linear=True)
+                tex.repeat_x = tex.repeat_y = False
+                pair.append((tex, self._framebuffer(tex)))
+            self.bloom_levels.append(pair)
+
+        self.ui_tex = self._target(size, 4)
+        self.overlay_tex = self._target(size, 4)
+        self.coverage_tex = self._target(size, 1)
+        self.coverage_fbo = self._framebuffer(self.coverage_tex)
+        self.line_tex = self._target(size, 4)
+        self.line_fbo = self._framebuffer(self.line_tex)
+
+    def resize(self, width: int, height: int):
+        """Rebuild the window-sized render targets (the phosphor starts empty)."""
+        width, height = max(1, int(width)), max(1, int(height))
+        if (width, height) == (self.width, self.height):
+            return
+        for obj in reversed(self._targets): # framebuffers before their textures
+            obj.release()
+        self._targets = []
+        self.width, self.height = width, height
+        self._create_targets()
+        self.clear()
 
     def _ensure_capacity(self, segments: int):
         if segments <= self.seg_capacity:
@@ -707,6 +733,9 @@ class CRTRenderer:
             self._bloom()
 
         target = target or self.ctx.screen
+        if target is self.ctx.screen:
+            # the window may have been resized since the context was created
+            target.viewport = (0, 0, self.width, self.height)
         target.use()
         self.ctx.disable(moderngl.BLEND)
 
