@@ -1,5 +1,8 @@
 """Audio source discovery and the startup device picker (no capture on import)."""
 
+import json
+from pathlib import Path
+import subprocess
 import sys
 
 
@@ -103,6 +106,39 @@ def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
 
 
 def choose_device(pa, devices, open_device):
+    """Isolate Cocoa Tk from SDL on macOS, including Tk's reopen handlers."""
+    if sys.platform != 'darwin':
+        return _choose_device(pa, devices, open_device)
+    try:
+        default_input = int(pa.get_default_input_device_info()['index'])
+    except (AttributeError, OSError, ValueError, LookupError):
+        default_input = None
+    payload = dict(devices=devices, default_input=default_input,
+                   selected_index=None, initial_status=None)
+    while True:
+        picker = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), '--picker'],
+            input=json.dumps(payload), capture_output=True, text=True)
+        if picker.returncode:
+            raise OSError(f'Audio source picker failed: {picker.stderr.strip()}')
+        try:
+            index = json.loads(picker.stdout)
+        except ValueError as exc:
+            raise OSError('Audio source picker returned an invalid selection.') from exc
+        if index is None:
+            return None
+        device = next((d for d in devices if d['index'] == index), None)
+        if device is None:
+            raise OSError('The selected audio device is no longer available.')
+        try:
+            return device, open_device(device)
+        except (OSError, ValueError) as exc:
+            payload['selected_index'] = index
+            payload['initial_status'] = (
+                f'Could not open this device: {exc}. Select another device and retry.')
+
+
+def _choose_device(pa, devices, open_device, initial_status=None, selected_index=None):
     """Keep the picker open on capture errors so another endpoint can be tried."""
     import tkinter as tk
     from tkinter import ttk
@@ -112,7 +148,9 @@ def choose_device(pa, devices, open_device):
     root.geometry('900x480')
     root.minsize(640, 360)
     result = None
-    mode = tk.StringVar(value='Input')
+    selected_device = next((d for d in devices if d['index'] == selected_index), {})
+    mode = tk.StringVar(value='Output loopback' if selected_device.get('isLoopbackDevice')
+                        else 'Input')
     status = tk.StringVar(value='Select an audio source, then click Start.')
     frame = ttk.Frame(root, padding=16)
     frame.pack(fill='both', expand=True)
@@ -144,6 +182,8 @@ def choose_device(pa, devices, open_device):
             default_index = int(default['index'])
         except (AttributeError, OSError, ValueError, LookupError):
             pass
+        if any(d['index'] == selected_index for d in visible):
+            default_index = selected_index
         for d in visible:
             tree.insert('', 'end', iid=str(d['index']), text=f"{d['index']}: {d['name']}",
                         values=(d['api_name'], int(d['maxInputChannels']),
@@ -192,6 +232,20 @@ def choose_device(pa, devices, open_device):
     root.bind('<Return>', launch)
     root.bind('<Escape>', lambda event: root.destroy())
     populate()
+    if initial_status:
+        status.set(initial_status)
     tree.focus_set()
     root.mainloop()
     return result
+
+
+if __name__ == '__main__' and sys.argv[1:] == ['--picker']:
+    from types import SimpleNamespace
+
+    payload = json.load(sys.stdin)
+    pa = SimpleNamespace(get_default_input_device_info=lambda: dict(
+        index=payload['default_input'] if payload['default_input'] is not None else -1))
+    result = _choose_device(
+        pa, payload['devices'], lambda device: device['index'],
+        payload['initial_status'], payload['selected_index'])
+    print(json.dumps(result[0]['index'] if result else None))

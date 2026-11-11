@@ -4,6 +4,10 @@ import os
 import sys
 import threading
 
+from window_support import configure_windowing, focus_window, ui_font
+
+configure_windowing()
+
 import numpy as np
 import pygame
 try:
@@ -1397,6 +1401,10 @@ stream.start_stream()
 
 pygame.init()
 
+# Load fonts before showing a window so its event loop can start immediately.
+font = ui_font(18)
+small_font = ui_font(13)
+
 
 def open_gl_window():
     """
@@ -1438,9 +1446,6 @@ else:
 pygame.display.set_caption("FluentScope Next")
 
 clock = pygame.time.Clock()
-
-font = pygame.font.SysFont("consolas", 18)
-small_font = pygame.font.SysFont("consolas", 13)
 
 # ==========================
 # View State
@@ -2127,10 +2132,18 @@ if gl_renderer is not None:
 
 running = True
 dt = 0.0
+focus_window()
 
 while running:
 
     for event in pygame.event.get():
+
+        if event.type == pygame.WINDOWTAKEFOCUS:
+            focus_window()
+            continue
+
+        if event.type == pygame.MOUSEBUTTONDOWN and not pygame.key.get_focused():
+            focus_window()
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if MENU_BUTTON.collidepoint(event.pos):
