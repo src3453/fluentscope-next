@@ -2,7 +2,7 @@
 -r requirements.txt
 
 # OpenGL rendering: CRT beam and GL Line renderers, anti-aliased spectrum lines
-# (needs a driver with OpenGL 3.3 core support; without it pygame lines are used)
+# (without ModernGL, pyglet draws the traces; OpenGL 3.3 is required in both cases)
 moderngl
 
 # Polyphase (band-limited) resampling of the CRT trace (linear interpolation without it)

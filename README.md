@@ -1,6 +1,6 @@
 # FluentScope Next
 
-FluentScope Next is a real-time audio oscilloscope and spectrum analyzer for audio capture devices exposed by PortAudio.
+FluentScope Next is a real-time audio oscilloscope and spectrum analyzer for audio capture devices exposed by PortAudio. Its window, input, text, and 2D graphics use pyglet 2.1; a graphics driver with OpenGL 3.3 core support is required.
 
 - **Scope** shows triggered waveforms with stereo display options, level meters, and automatic gain control.
 - **Spectrum** shows the frequency spectrum and a scrolling waterfall.
@@ -68,19 +68,25 @@ Alternatively, run without arguments and select **Output loopback → macOS Syst
 
 The Swift helper in `native/macos_loopback.swift` is compiled on first use and cached in `~/Library/Caches/FluentScopeNext`. The first build may take a few minutes. Allow the macOS recording permission when prompted. If access is denied or startup times out, enable the launching terminal/app or capture helper in **System Settings → Privacy & Security → Screen & System Audio Recording** (named **Screen Recording** on older macOS releases), restart the launching app, and retry. Ordinary microphone inputs require the separate **Microphone** permission. Device listing does not request recording access. Older macOS releases can still use ordinary or virtual input devices; native system audio requires 13+.
 
-To check the automated audio discovery and stream lifecycle tests:
+To check the automated audio, window sizing, and rendering tests:
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-To enable the OpenGL renderers (CRT and GL Line), install ModernGL and use a graphics driver with OpenGL 3.3 core support. SciPy is optional and enables polyphase resampling for the CRT trace. `requirements-full.txt` installs the required packages plus all optional ones:
+To enable the CRT and GL Line renderers, install ModernGL. SciPy is optional and enables polyphase resampling for the CRT trace. `requirements-full.txt` installs the required packages plus all optional ones:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements-full.txt
 ```
 
-Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygame.
+Without ModernGL, traces and spectrum lines are drawn with pyglet. Pygame and SDL are no longer required. After updating an existing installation, reinstall `requirements.txt` (or `requirements-full.txt`) to add pyglet. Saved settings are retained; the former `Pygame` trace renderer is mapped to `Pyglet` automatically.
+
+The optional native smoke tests open real windows with synthetic stereo audio, exercise all views and available renderers, and check input, resize, Retina scaling, and shutdown. They do not record microphone or system audio. Run them on a graphical desktop with:
+
+```sh
+FLUENTSCOPE_NATIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Controls
 
@@ -91,21 +97,24 @@ Without ModernGL (or OpenGL 3.3), traces and spectrum lines are drawn with pygam
 | F3 | Show or hide the status text and menu button |
 | F4 | Reset the window to its default size (1000x600) |
 | F5 / Shift+F5 | Cycle the maximum frame rate: 30, 60, 120, 144, 180, 240, Unlimited (ignored while VSync is on) |
-| F6 | Toggle VSync (takes effect with the OpenGL window) |
+| F6 | Toggle VSync |
+| F7 | Toggle Retina plot resolution (macOS, with ModernGL) |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
 | R / M | Cycle the trigger or stereo mode |
 | X / Shift+X | Cycle the Scope time span forward or backward |
-| P | Toggle step or smooth Scope lines (Pygame and GL Line renderers) |
+| P | Toggle step or smooth Scope lines (Pyglet and GL Line renderers) |
 | A / H | Cycle automatic gain control (Scope and Lissajous) or toggle gain peak hold |
 | J / K / D | Toggle the scope grid, fixed-gain dBFS labels, or AGC dBFS labels |
 | L / W / I | Cycle the X/Y mode, swap axes, or change axis inversion |
-| C / Shift+C | Cycle the trace renderer: CRT, GL Line, Pygame (needs OpenGL) |
+| C / Shift+C | Cycle the trace renderer: CRT, GL Line, Pyglet (with ModernGL) |
 | N / Shift+N | Make GL lines (GL Line traces and spectrum lines) thicker or thinner |
 | O | Toggle anti-aliasing of GL lines |
 | T / Shift+T | Cycle themes forward or backward |
 
 The **Time span** control in the F1 menu selects how much audio the Scope shows across its horizontal axis. At 48 kHz the options are 5.33, 10.67, 21.33 (default), 42.67, and 85.33 ms.
+
+On macOS, **Display → Retina resolution** in the F1 menu (or F7) switches the plot's offscreen render targets between logical and native display resolution immediately, without recreating the window or OpenGL context. It defaults to Off and is saved as `retina` in `fluentscope_settings.json`. Window size and mouse coordinates stay in logical points, and line widths retain their apparent size. The HUD and controls menu always render at native resolution, including their font glyphs. Moving between displays updates the rendering resolution automatically. Retina uses more GPU memory and processing on high-density displays; on a standard-density display both settings render at the same resolution. Without ModernGL, pyglet draws everything at native resolution and this option is hidden.
 
 Settings are saved to `fluentscope_settings.json` beside the script.
 
@@ -119,8 +128,7 @@ Copyright © 2026 src3453. FluentScope Next is distributed under the [MIT Licens
 | --- | --- |
 | Python | [Python Software Foundation License](https://docs.python.org/3/license.html) |
 | NumPy | [BSD 3-Clause and bundled component notices](https://numpy.org/doc/stable/license.html) |
-| pygame | [LGPL 2.1](https://github.com/pygame/pygame/blob/2.6.1/docs/LGPL.txt) and [bundled library notices](https://github.com/pygame/pygame/tree/2.6.1/docs/licenses) |
-| SDL 2 | [zlib](https://github.com/libsdl-org/SDL/blob/SDL2/LICENSE.txt) |
+| pyglet | [BSD 3-Clause](https://github.com/pyglet/pyglet/blob/master/LICENSE) |
 | PyAudio | [MIT](https://pypi.org/project/PyAudio/) |
 | PyAudioWPatch (Windows) | [MIT](https://github.com/s0d3s/PyAudioWPatch/blob/master/LICENSE.txt) |
 | PortAudio | [MIT](https://github.com/PortAudio/portaudio/blob/master/LICENSE.txt) |

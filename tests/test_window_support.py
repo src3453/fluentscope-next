@@ -1,48 +1,40 @@
-import os
 import unittest
 from unittest.mock import Mock, patch
 
-import window_support
+from window_support import configure_windowing, create_window, mouse_position, render_size
 
 
 class WindowSupportTests(unittest.TestCase):
-    def test_cocoa_hints_are_set_before_initializing_video(self):
-        with patch('window_support.sys.platform', 'darwin'), patch.dict(os.environ, {}, clear=True):
-            window_support.configure_windowing()
-            self.assertEqual(os.environ['SDL_MAC_BACKGROUND_APP'], '0')
-            self.assertEqual(os.environ['SDL_MOUSE_FOCUS_CLICKTHROUGH'], '1')
+    def test_configuration_preserves_logical_coordinates_without_shadow_window(self):
+        pyglet = Mock()
+        with patch.dict('sys.modules', {'pyglet': pyglet}):
+            configure_windowing()
+        self.assertFalse(pyglet.options.shadow_window)
+        self.assertEqual(pyglet.options.dpi_scaling, 'stretch')
 
-    def test_other_platforms_do_not_change_hints(self):
-        with patch('window_support.sys.platform', 'win32'), patch.dict(os.environ, {}, clear=True):
-            window_support.configure_windowing()
-            self.assertNotIn('SDL_MOUSE_FOCUS_CLICKTHROUGH', os.environ)
+    def test_window_uses_native_pyglet_controls_and_starts_hidden(self):
+        pyglet = Mock()
+        with patch.dict('sys.modules', {'pyglet': pyglet}):
+            window = create_window(1000, 600, vsync=True, minimum_size=(640, 480))
+        self.assertIs(window, pyglet.window.Window.return_value)
+        self.assertTrue(pyglet.window.Window.call_args.kwargs['vsync'])
+        self.assertFalse(pyglet.window.Window.call_args.kwargs['visible'])
+        window.set_minimum_size.assert_called_once_with(640, 480)
 
-    def test_macos_font_never_invokes_system_font_discovery(self):
-        font = Mock()
-        with patch('window_support.sys.platform', 'darwin'), \
-                patch('window_support.Path.is_file', return_value=True), \
-                patch.dict('sys.modules', {'pygame': Mock(font=font)}):
-            window_support.ui_font(18)
-        font.Font.assert_called_once_with('/System/Library/Fonts/Menlo.ttc', 18)
-        font.SysFont.assert_not_called()
+    def test_macos_retina_selects_backing_pixels_without_changing_window_size(self):
+        logical, pixels = (1000, 600), (2000, 1200)
+        self.assertEqual(render_size(logical, pixels, False, platform='darwin'), logical)
+        self.assertEqual(render_size(logical, pixels, True, platform='darwin'), pixels)
 
-    def test_missing_macos_font_uses_bundled_font(self):
-        font = Mock()
-        with patch('window_support.sys.platform', 'darwin'), \
-                patch('window_support.Path.is_file', return_value=False), \
-                patch.dict('sys.modules', {'pygame': Mock(font=font)}):
-            window_support.ui_font(13)
-        font.Font.assert_called_once_with(None, 13)
-        font.SysFont.assert_not_called()
+    def test_standard_density_display_uses_same_size_with_either_setting(self):
+        for retina in (False, True):
+            self.assertEqual(render_size((1000, 600), (1000, 600), retina, platform='darwin'),
+                             (1000, 600))
 
-    def test_focus_uses_existing_sdl_window(self):
-        window = Mock()
-        with patch('window_support.sys.platform', 'darwin'), \
-                patch('window_support._display_window', None), \
-                patch.dict('sys.modules', {'pygame': Mock(error=RuntimeError),
-                                          'pygame._sdl2': Mock(Window=window)}):
-            window_support.focus_window()
-            window_support.focus_window()
-            self.assertIs(window_support._display_window, window.from_display_module.return_value)
-        window.from_display_module.assert_called_once_with()
-        self.assertEqual(window.from_display_module.return_value.focus.call_count, 2)
+    def test_other_platforms_use_actual_framebuffer_pixels(self):
+        for platform in ('win32', 'linux'):
+            self.assertEqual(render_size((1000, 600), (1250, 750), False, platform=platform),
+                             (1250, 750))
+
+    def test_mouse_coordinates_stay_in_logical_points(self):
+        self.assertEqual(mouse_position(150, 350, 600), (150, 250))

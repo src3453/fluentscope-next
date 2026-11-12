@@ -1,120 +1,42 @@
-"""Platform-specific SDL window activation and UI font initialization."""
-import os
-from pathlib import Path
+"""Pyglet window setup and logical/backing size helpers."""
 import sys
-
-_display_window = None
 
 
 def configure_windowing():
-    """Set Cocoa hints before pygame initializes SDL video."""
-    if sys.platform == 'darwin':
-        os.environ.setdefault('SDL_MAC_BACKGROUND_APP', '0')
-        # A click that activates the app should also operate the clicked control.
-        os.environ.setdefault('SDL_MOUSE_FOCUS_CLICKTHROUGH', '1')
+    # Set these before importing pyglet.window (and before the audio picker).
+    import pyglet
+
+    pyglet.options.shadow_window = False
+    # In pyglet 2.1 this preserves logical Cocoa window and mouse coordinates
+    # while get_framebuffer_size() exposes native backing pixels.
+    pyglet.options.dpi_scaling = 'stretch'
+    pyglet.options.debug_gl = False
 
 
-def _window():
-    """The SDL window of pygame.display (raises pygame.error without one)."""
-    global _display_window
-    from pygame._sdl2 import Window
+def desktop_size():
+    import pyglet
 
-    # pygame stores a borrowed pointer to this wrapper in SDL event data.
-    # Keep it alive for the entire display lifetime.
-    if _display_window is None:
-        _display_window = Window.from_display_module()
-    return _display_window
+    screen = pyglet.display.get_display().get_default_screen()
+    return screen.width, screen.height
 
 
-def focus_window():
-    """Activate on startup or a user focus request, never on mere mouse hover."""
-    if sys.platform != 'darwin':
-        return
-    import pygame
+def create_window(width, height, *, vsync=False, minimum_size=(640, 480)):
+    import pyglet
 
-    try:
-        _window().focus()
-    except pygame.error as exc:
-        print(f'Warning: could not activate the window: {exc}')
-
-
-def _sdl_library():
-    """The SDL2 library pygame itself loaded (bundled next to it in the wheels)."""
-    import ctypes
-    import ctypes.util
-    import pygame
-
-    base = Path(pygame.__file__).parent
-    patterns = ('SDL2.dll', '.dylibs/libSDL2*.dylib', '../pygame.libs/libSDL2*.so*')
-    for pattern in patterns:
-        for path in sorted(base.glob(pattern)):
-            return ctypes.CDLL(str(path))
-    name = ctypes.util.find_library('SDL2')
-    if name is None:
-        raise OSError('SDL2 library not found')
-    return ctypes.CDLL(name)
+    config = pyglet.gl.Config(double_buffer=True, major_version=3, minor_version=3,
+                              forward_compatible=True, depth_size=0)
+    window = pyglet.window.Window(width=width, height=height, caption='FluentScope Next',
+                                  resizable=True, vsync=vsync, config=config, visible=False)
+    window.set_minimum_size(*minimum_size)
+    return window
 
 
-def set_minimum_window_size(width, height):
-    """Keep the user from shrinking the window below what the layout handles."""
-    try:
-        window = _window()
-        if hasattr(window, 'minimum_size'): # pygame-ce
-            window.minimum_size = (width, height)
-            return
-        import ctypes
-
-        sdl = _sdl_library()
-        sdl.SDL_GetWindowFromID.restype = ctypes.c_void_p
-        sdl.SDL_GetWindowFromID.argtypes = [ctypes.c_uint32]
-        sdl.SDL_SetWindowMinimumSize.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-        handle = sdl.SDL_GetWindowFromID(window.id)
-        if not handle:
-            raise RuntimeError('no SDL window')
-        sdl.SDL_SetWindowMinimumSize(handle, width, height)
-    except Exception as exc:
-        print(f'Warning: could not set the minimum window size: {exc}')
+def render_size(logical_size, framebuffer_size, retina, *, platform=None):
+    """Retina changes offscreen resolution, never the native window/context."""
+    platform = sys.platform if platform is None else platform
+    return framebuffer_size if platform != 'darwin' or retina else logical_size
 
 
-def set_gl_swap_interval(interval):
-    """
-    VSync on / off for the current OpenGL context without recreating the window
-    (1 = sync to the display, 0 = immediate). Returns False if it failed.
-    """
-    try:
-        import ctypes
-
-        sdl = _sdl_library()
-        sdl.SDL_GL_SetSwapInterval.argtypes = [ctypes.c_int]
-        sdl.SDL_GL_SetSwapInterval.restype = ctypes.c_int
-        if sdl.SDL_GL_SetSwapInterval(int(interval)) != 0:
-            raise RuntimeError('SDL_GL_SetSwapInterval failed')
-        return True
-    except Exception as exc:
-        print(f'Warning: could not change VSync: {exc}')
-        return False
-
-
-def resize_window(width, height):
-    """
-    Resize the existing window in place (keeps an OpenGL context alive),
-    leaving maximized / fullscreen first. Returns False if it failed.
-    """
-    try:
-        window = _window()
-        window.restore()
-        window.size = (width, height)
-        return True
-    except Exception as exc:
-        print(f'Warning: could not resize the window: {exc}')
-        return False
-
-
-def ui_font(size):
-    import pygame
-
-    if sys.platform == 'darwin':
-        # SysFont can launch X11's fc-list and block the Cocoa event loop.
-        path = Path('/System/Library/Fonts/Menlo.ttc')
-        return pygame.font.Font(str(path) if path.is_file() else None, size)
-    return pygame.font.SysFont('consolas', size)
+def mouse_position(x, y, height):
+    """Pyglet's bottom-left coordinates to the application's top-left layout."""
+    return x, height - y

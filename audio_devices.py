@@ -106,7 +106,7 @@ def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
 
 
 def choose_device(pa, devices, open_device):
-    """Isolate Cocoa Tk from SDL on macOS, including Tk's reopen handlers."""
+    """Isolate Cocoa Tk from the rendering window, including Tk's reopen handlers."""
     if sys.platform != 'darwin':
         return _choose_device(pa, devices, open_device)
     try:

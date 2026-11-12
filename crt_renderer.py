@@ -1,6 +1,6 @@
 """
 CRT oscilloscope beam renderer for FluentScope Next (OpenGL 3.3 via moderngl,
-running inside the SDL2 window that pygame creates with the OPENGL flag).
+running inside a pyglet OpenGL window).
 
 Beam model after:
   - Oscilloscope by Hansi Raber (https://github.com/kritzikratzi/Oscilloscope,
@@ -23,7 +23,7 @@ by exp(-dt / persistence) before the new beam is added. A two-level bloom
 (half / quarter resolution gaussian blur) gives the glow, and the final pass
 maps the light through the display gamma curve with a smooth saturation knee
 (overdriven parts bleach toward white) and lays it over the 2D UI surface
-drawn by pygame.
+drawn by pyglet.
 """
 
 import math
@@ -175,16 +175,13 @@ void main() {
 
 COMPOSITE_FRAG = """
 #version 330
-uniform sampler2D uUI;     // pygame surface, top row first
+uniform sampler2D uUI;     // pyglet UI framebuffer, bottom row first
 uniform sampler2D uHDR;    // accumulated beam light
 uniform sampler2D uBloomNear;
 uniform sampler2D uBloomFar;
 uniform sampler2D uLines;  // premultiplied plain line layer
-uniform sampler2D uOverlay; // pygame SRCALPHA surface (text, menu) on top of everything
 uniform int uCRT;
 uniform int uLineLayer;
-uniform int uUseOverlay;
-uniform vec4 uUIRect; // left, top, right, bottom in UI pixels
 uniform int uInk;          // light background: the beam darkens like ink
 uniform float uExposure;
 uniform float uBloomNearStr;
@@ -208,22 +205,13 @@ float gamma_saturate(float L, out float v) {
 vec3 base_color(vec2 uiUV);
 
 void main() {
-    vec2 uiUV = vec2(vUV.x, 1.0 - vUV.y);
+    vec2 uiUV = vUV;
     vec3 color = base_color(uiUV);
-    if (uUseOverlay == 1) {
-        vec4 top = texture(uOverlay, uiUV);
-        color = mix(color, top.rgb, top.a);
-    }
     fragColor = vec4(color, 1.0);
 }
 
 vec3 base_color(vec2 uiUV) {
     vec3 ui = texture(uUI, uiUV).rgb;
-    vec2 uiPixel = uiUV * vec2(textureSize(uUI, 0));
-
-    if (all(greaterThanEqual(uiPixel, uUIRect.xy)) && all(lessThan(uiPixel, uUIRect.zw))) {
-        return ui; // no beam / lines inside this rectangle
-    }
     if (uLineLayer == 1) {
         vec4 line = texture(uLines, vUV);
         ui = ui * (1.0 - line.a) + line.rgb;
@@ -372,8 +360,7 @@ def upsample(values: np.ndarray, factor: int, margin: int = 0) -> np.ndarray:
 class CRTRenderer:
     """
     Usage per frame:
-        renderer.upload_ui(surface)
-        renderer.upload_overlay(text_surface)           # optional, drawn on top
+        canvas.render(window, target=renderer.ui_fbo, ...)
         if crt:
             renderer.begin_frame(dt)
             renderer.draw_beam(points, energy, color)   # any number of times
@@ -383,10 +370,10 @@ class CRTRenderer:
         renderer.present(crt)
     """
 
-    def __init__(self, ctx: moderngl.Context, width: int, height: int):
+    def __init__(self, ctx: moderngl.Context, width: int, height: int, *, drawable_size=None):
         self.ctx = ctx
-        self.width = width
-        self.height = height
+        self.logical_size = (width, height)
+        self.width, self.height = drawable_size or self.logical_size
 
         # tunables (set from the application)
         self.beam_sigma = 1.3       # px
@@ -420,8 +407,6 @@ class CRTRenderer:
         self.seg_buffer = None
         self.beam_vao = None
         self._ensure_capacity(16384)
-
-        self.overlay = False        # upload_overlay() was called this frame
 
         # plain line renderer (non-CRT)
         self.line_width = 2.0       # px
@@ -485,24 +470,38 @@ class CRTRenderer:
                 pair.append((tex, self._framebuffer(tex)))
             self.bloom_levels.append(pair)
 
-        self.ui_tex = self._target(size, 4)
-        self.overlay_tex = self._target(size, 4)
+        self.ui_tex = self._target(size, 4, linear=True)
+        self.ui_fbo = self._framebuffer(self.ui_tex)
         self.coverage_tex = self._target(size, 1)
         self.coverage_fbo = self._framebuffer(self.coverage_tex)
         self.line_tex = self._target(size, 4)
         self.line_fbo = self._framebuffer(self.line_tex)
 
-    def resize(self, width: int, height: int):
-        """Rebuild the window-sized render targets (the phosphor starts empty)."""
+    def resize(self, width: int, height: int, *, drawable_size=None):
+        """Resize render targets while retaining logical layout coordinates."""
         width, height = max(1, int(width)), max(1, int(height))
-        if (width, height) == (self.width, self.height):
+        pixels = drawable_size or (width, height)
+        if (width, height) == self.logical_size and pixels == (self.width, self.height):
             return
         for obj in reversed(self._targets): # framebuffers before their textures
             obj.release()
         self._targets = []
-        self.width, self.height = width, height
+        self.logical_size = (width, height)
+        self.width, self.height = pixels
         self._create_targets()
         self.clear()
+
+    def release(self):
+        """Release GPU resources while the owning pyglet context is current."""
+        for obj in reversed(self._targets):
+            obj.release()
+        self._targets.clear()
+        for name in ('beam_vao', 'line_vao', 'fade_vao', 'down_vao', 'blur_vao',
+                     'comp_vao', 'line_resolve_vao', 'seg_buffer', 'line_seg_buffer',
+                     'beam_prog', 'line_prog', 'fade_prog', 'down_prog', 'blur_prog',
+                     'comp_prog', 'line_resolve_prog'):
+            getattr(self, name).release()
+        self.ctx.release()
 
     def _ensure_capacity(self, segments: int):
         if segments <= self.seg_capacity:
@@ -537,38 +536,21 @@ class CRTRenderer:
             for _, fbo in pair:
                 fbo.clear(0.0, 0.0, 0.0, 0.0)
 
-    # ---------- UI ----------
-
-    def _upload(self, tex, surface, alpha):
-        import pygame
-
-        masks = surface.get_masks()
-        if (
-            surface.get_bitsize() == 32
-            and surface.get_pitch() == self.width * 4
-            and masks[:3] == (0xFF0000, 0x00FF00, 0x0000FF)
-            and (not alpha or masks[3] == 0xFF000000)
-        ):
-            # little-endian (A/X)RGB in memory = B, G, R, A/X bytes: no conversion
-            tex.swizzle = "BGRA" if alpha else "BGR1"
-            tex.write(surface.get_buffer().raw)
-        else:
-            tex.swizzle = "RGBA" if alpha else "RGB1"
-            tex.write(pygame.image.tobytes(surface, "RGBA"))
-
-    def upload_ui(self, surface):
-        """Upload a pygame surface (same size as the window) as the 2D layer."""
-        self._upload(self.ui_tex, surface, alpha=False)
-
-    def upload_overlay(self, surface):
-        """
-        Upload a per-pixel alpha pygame surface (same size as the window) that the
-        next present() lays over everything, the lines and the beam included.
-        """
-        self._upload(self.overlay_tex, surface, alpha=True)
-        self.overlay = True
-
     # ---------- beam ----------
+
+    @property
+    def pixel_scale(self):
+        return np.array((self.width / self.logical_size[0],
+                         self.height / self.logical_size[1]), dtype=np.float32)
+
+    def _pixel_scissor(self, scissor):
+        if scissor is None:
+            return None
+        sx, sy = self.pixel_scale
+        left, top, width, height = scissor
+        x0, x1 = round(left * sx), round((left + width) * sx)
+        y0, y1 = round(top * sy), round((top + height) * sy)
+        return x0, self.height - y1, x1 - x0, y1 - y0
 
     def begin_frame(self, dt: float):
         """Let the phosphor decay for dt seconds."""
@@ -612,7 +594,7 @@ class CRTRenderer:
                  cut off outside (like the edge of the tube face).
         """
 
-        points = np.asarray(points, dtype=np.float32)
+        points = np.asarray(points, dtype=np.float32) * self.pixel_scale
         n = len(points) - 1
         if n <= 0:
             return
@@ -628,13 +610,11 @@ class CRTRenderer:
         if self.ink:
             color = tuple(1.0 - c for c in color) # absorbed light
         self.beam_prog["uViewport"].value = (self.width, self.height)
-        self.beam_prog["uSigma"].value = self.beam_sigma
+        self.beam_prog["uSigma"].value = self.beam_sigma * float(self.pixel_scale[0])
         self.beam_prog["uColor"].value = tuple(color)
 
         self.hdr_fbo.use()
-        if scissor is not None:
-            left, top, w, h = scissor
-            self.hdr_fbo.scissor = (int(left), int(self.height - top - h), int(w), int(h))
+        self.hdr_fbo.scissor = self._pixel_scissor(scissor)
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = moderngl.ONE, moderngl.ONE
         self.beam_vao.render(moderngl.TRIANGLE_STRIP, vertices=4, instances=n)
@@ -659,7 +639,7 @@ class CRTRenderer:
         width: pixels, default self.line_width.
         """
 
-        points = np.asarray(points, dtype=np.float32)
+        points = np.asarray(points, dtype=np.float32) * self.pixel_scale
         n = len(points) - 1
         if n <= 0:
             return
@@ -671,16 +651,14 @@ class CRTRenderer:
         self.line_seg_buffer.write(segments.tobytes())
 
         width = max(float(self.line_width if width is None else width), 0.05)
+        width *= float(self.pixel_scale[0])
         prog = self.line_prog
         prog["uViewport"].value = (self.width, self.height)
         prog["uWidth"].value = width
         prog["uAA"].value = 1 if self.line_aa else 0
         prog["uExtent"].value = max(width, 1.0) * 0.5 + 1.0
 
-        rect = None
-        if scissor is not None:
-            left, top, w, h = scissor
-            rect = (int(left), int(self.height - top - h), int(w), int(h))
+        rect = self._pixel_scissor(scissor)
 
         # 1) coverage of the whole polyline, merged with MAX
         self.coverage_fbo.use()
@@ -723,7 +701,7 @@ class CRTRenderer:
                 self.blur_vao.render(moderngl.TRIANGLES, vertices=3)
             src = tex_a
 
-    def present(self, crt: bool, target=None, *, ui_rect=None):
+    def present(self, crt: bool, target=None, *, framebuffer_size=None):
         """
         Composite the UI, the line layer (if begin_lines() was called this frame)
         and the beam (if crt) into `target` (default: the window).
@@ -735,7 +713,7 @@ class CRTRenderer:
         target = target or self.ctx.screen
         if target is self.ctx.screen:
             # the window may have been resized since the context was created
-            target.viewport = (0, 0, self.width, self.height)
+            target.viewport = (0, 0, *(framebuffer_size or (self.width, self.height)))
         target.use()
         self.ctx.disable(moderngl.BLEND)
 
@@ -744,7 +722,6 @@ class CRTRenderer:
         self.bloom_levels[0][0][0].use(2)
         self.bloom_levels[1][0][0].use(3)
         self.line_tex.use(4)
-        self.overlay_tex.use(5)
 
         prog = self.comp_prog
         prog["uUI"].value = 0
@@ -755,14 +732,6 @@ class CRTRenderer:
         prog["uCRT"].value = 1 if crt else 0
         prog["uLineLayer"].value = 1 if self.line_layer else 0
         self.line_layer = False
-        prog["uOverlay"].value = 5
-        prog["uUseOverlay"].value = 1 if self.overlay else 0
-        self.overlay = False
-        if ui_rect is None:
-            prog["uUIRect"].value = (0, 0, 0, 0)
-        else:
-            x, y, width, height = ui_rect
-            prog["uUIRect"].value = (x, y, x + width, y + height)
         prog["uInk"].value = 1 if self.ink else 0
         prog["uExposure"].value = self.exposure
         # glow is light; on a light background (ink) it would only smear the trace

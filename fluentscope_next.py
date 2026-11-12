@@ -5,14 +5,13 @@ import sys
 import threading
 
 from window_support import (
-    configure_windowing, focus_window, resize_window, set_gl_swap_interval,
-    set_minimum_window_size, ui_font,
+    configure_windowing, create_window, desktop_size, render_size, mouse_position,
 )
 
 configure_windowing()
 
 import numpy as np
-import pygame
+import pyglet
 try:
     if sys.platform != "win32":
         raise ImportError
@@ -192,6 +191,7 @@ SCOPE_AGC_HOLD_TIME = 0.5 # seconds
 FPS = 180 # frame-rate cap; no effect when VSYNC is enabled ([F5] cycles FPS_OPTIONS)
 FPS_OPTIONS = (30, 60, 120, 144, 180, 240, 0) # 0 = unlimited
 VSYNC = False # [F6] if True, the display is synchronized with the monitor's refresh rate, otherwise it runs at up to FPS
+RETINA = False # [F7] native plot resolution on macOS; HUD/menu always use native pixels
 
 LINE_IS_STEP = True # start with step lines ([P] toggles; smooth = straight lines between samples)
 
@@ -201,16 +201,15 @@ SPEC_OVERLAY_RATIO = 0.4 # height ratio of the spectrum overlay on the scope vie
 # CRT Beam Settings
 # ==========================
 # Shader-based analog oscilloscope look (crt_renderer.py, needs `pip install moderngl`).
-# The window is an SDL OpenGL window; the 2D UI is still drawn with pygame onto an
-# offscreen surface and composited under the beam.
+# Pyglet owns the window and draws vector UI; ModernGL composites the traces.
 
-USE_OPENGL = True # False = plain pygame window (no CRT / GL line option)
+USE_OPENGL = True # False = pyglet lines only (no CRT / GL line option)
 
 # Trace renderer ([C] cycles, needs OpenGL):
 #   "CRT"     - analog beam (settings below)
 #   "GL Line" - plain lines drawn with OpenGL: free width, optional anti-aliasing
-#   "Pygame"  - plain 2D lines drawn by pygame
-TRACE_RENDERERS = ["CRT", "GL Line", "Pygame"]
+#   "Pyglet"  - plain 2D lines drawn by pyglet
+TRACE_RENDERERS = ["CRT", "GL Line", "Pyglet"]
 TRACE_RENDERER = "CRT"
 
 LINE_WIDTHS = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0] # GL line width in pixels ([N])
@@ -1092,8 +1091,8 @@ def _meter_y(db, top, height):
 def draw_level_meter(surface, meter, theme, small_font, left, top, width, height, colors):
     """Draws the meter panel inside (left, top, width, height)."""
 
-    pygame.draw.rect(surface, theme["bg"], (left, 0, width, surface.get_height()))
-    pygame.draw.line(surface, theme["center"], (left, 0), (left, surface.get_height()))
+    ui.rect(surface, theme["bg"], (left, 0, width, surface.get_height()))
+    ui.line(surface, theme["center"], (left, 0), (left, surface.get_height()))
 
     label_w = 26
     clip_h = 8
@@ -1105,7 +1104,7 @@ def draw_level_meter(surface, meter, theme, small_font, left, top, width, height
 
     for db in METER_TICKS:
         y = _meter_y(db, bar_top, bar_h)
-        pygame.draw.line(surface, theme["grid"], (bars_left - 2, y), (left + width - gap, y))
+        ui.line(surface, theme["grid"], (bars_left - 2, y), (left + width - gap, y))
         text = small_font.render(f"{db}", True, theme["text"])
         surface.blit(text, (bars_left - 4 - text.get_width(), y - text.get_height() // 2))
 
@@ -1116,7 +1115,7 @@ def draw_level_meter(surface, meter, theme, small_font, left, top, width, height
         x = bars_left + ch * (bar_w + gap)
 
         # background track
-        pygame.draw.rect(surface, theme["grid"], (x, bar_top, bar_w, bar_h), 1)
+        ui.rect(surface, theme["grid"], (x, bar_top, bar_w, bar_h), 1)
 
         # peak (dim) and RMS (solid) bars
         for value, bar_color in (
@@ -1125,19 +1124,19 @@ def draw_level_meter(surface, meter, theme, small_font, left, top, width, height
         ):
             y = _meter_y(value, bar_top, bar_h)
             if y < bottom:
-                pygame.draw.rect(surface, bar_color, (x + 1, y, bar_w - 2, bottom - y))
+                ui.rect(surface, bar_color, (x + 1, y, bar_w - 2, bottom - y))
                 if y < warn_y:
                     warn = METER_WARN_COLOR if bar_color == color else blend(METER_WARN_COLOR, theme["bg"], 0.35)
-                    pygame.draw.rect(surface, warn, (x + 1, y, bar_w - 2, warn_y - y))
+                    ui.rect(surface, warn, (x + 1, y, bar_w - 2, warn_y - y))
 
         # peak hold marker
         y = _meter_y(meter.hold_db[ch], bar_top, bar_h)
         if meter.hold_db[ch] > METER_DB_MIN:
-            pygame.draw.line(surface, theme["text"], (x + 1, y), (x + bar_w - 2, y), 2)
+            ui.line(surface, theme["text"], (x + 1, y), (x + bar_w - 2, y), 2)
 
         # clip indicator
         clip_color = METER_CLIP_COLOR if meter.clip_time[ch] > 0.0 else theme["grid"]
-        pygame.draw.rect(surface, clip_color, (x, top, bar_w, clip_h))
+        ui.rect(surface, clip_color, (x, top, bar_w, clip_h))
 
         text = small_font.render(name, True, color)
         surface.blit(text, (x + (bar_w - text.get_width()) // 2, bar_top + bar_h + 2))
@@ -1235,9 +1234,9 @@ def draw_spectrum_grid(surface, analyzer, theme, top, height):
     """Grid lines only; draw before the spectrum."""
     bottom = top + height
     for x, _ in _visible_freq_ticks(analyzer):
-        pygame.draw.line(surface, theme["grid"], (x, top), (x, bottom))
+        ui.line(surface, theme["grid"], (x, top), (x, bottom))
     for y, _ in _db_ticks(analyzer, top, height):
-        pygame.draw.line(surface, theme["grid"], (0, y), (analyzer.width, y))
+        ui.line(surface, theme["grid"], (0, y), (analyzer.width, y))
 
 
 def draw_spectrum_labels(surface, analyzer, theme, small_font, top, height, show_db):
@@ -1256,7 +1255,7 @@ def draw_spectrum_labels(surface, analyzer, theme, small_font, top, height, show
 def draw_spectrum(surface, analyzer, theme, top, height, filled, line_queue=None):
     """
     line_queue: list to receive (points, color, scissor, width scale) for the
-    OpenGL line renderer instead of drawing the line with pygame (the fill is
+    OpenGL line renderer instead of drawing the line with pyglet (the fill is
     always drawn here).
     """
     points = analyzer.line_points(top, height, round_pixels=line_queue is None)
@@ -1264,13 +1263,13 @@ def draw_spectrum(surface, analyzer, theme, top, height, filled, line_queue=None
     if filled:
         bottom = top + height - 1
         polygon = np.vstack((points, [[analyzer.width - 1, bottom], [0, bottom]]))
-        pygame.draw.polygon(surface, theme["fill"], polygon)
+        ui.polygon(surface, theme["fill"], polygon)
 
     if line_queue is not None:
-        # overlay at half the trace width, like the pygame 1 px / 2 px lines
+        # overlay at half the trace width, like the pyglet 1 px / 2 px lines
         line_queue.append((points, theme["spectrum"], (0, top, analyzer.width, height), 1.0 if filled else 0.5))
     else:
-        pygame.draw.lines(surface, theme["spectrum"], False, points, 1 if not filled else 2)
+        ui.lines(surface, theme["spectrum"], False, points, 1 if not filled else 2)
 
 
 class Waterfall:
@@ -1281,8 +1280,7 @@ class Waterfall:
         self.height = height
         self.history = np.zeros((height, width), dtype=np.uint8)
         self.head = 0
-        self.surface = pygame.Surface((width, height))
-        self.row_surface = pygame.Surface((width, 1))
+        self.image = ui.Image(width, height)
         self.pending_rows = 0.0
 
     def push(self, levels, lut, dt):
@@ -1293,14 +1291,12 @@ class Waterfall:
         self.pending_rows -= rows
         rows = min(rows, self.height)
 
-        row_rgb = lut[levels][:, None, :]
-        pygame.surfarray.blit_array(self.row_surface, row_rgb)
-
-        self.surface.scroll(0, rows)
-        for r in range(rows):
+        self.image.pixels[rows:] = self.image.pixels[:-rows].copy()
+        self.image.pixels[:rows] = lut[levels]
+        self.image.changed()
+        for _ in range(rows):
             self.head = (self.head + 1) % self.height
             self.history[self.head] = levels
-            self.surface.blit(self.row_surface, (0, r))
 
     def resized(self, width, height):
         """A copy at another size: columns resampled, newest rows kept."""
@@ -1316,7 +1312,8 @@ class Waterfall:
     def rerender(self, lut):
         order = (self.head - np.arange(self.height)) % self.height
         image = lut[self.history[order]]  # (h, w, 3)
-        pygame.surfarray.blit_array(self.surface, image.transpose(1, 0, 2))
+        self.image.pixels[:] = image
+        self.image.changed()
 
 
 # ==========================
@@ -1461,84 +1458,59 @@ saved_settings = load_settings()
 # needed before the window opens (the swap interval is set at creation)
 if isinstance(saved_settings.get("vsync"), bool):
     VSYNC = saved_settings["vsync"]
+if isinstance(saved_settings.get("retina"), bool):
+    RETINA = saved_settings["retina"]
 if saved_settings.get("max_fps") in FPS_OPTIONS and type(saved_settings["max_fps"]) is int:
     FPS = saved_settings["max_fps"]
 
 
 # ==========================
-# Pygame
+# Pyglet
 # ==========================
 
-pygame.init()
+from pyglet.window import key, mouse
+import ui_renderer as ui
 
 
 def initial_window_size():
-    """The last window size from the settings, kept on the desktop and above the minimum."""
+    """Remember logical window size, constrained to the desktop and layout minimum."""
     width, height = WIDTH, HEIGHT
     size = saved_settings.get("window_size")
     if isinstance(size, list) and len(size) == 2 and all(type(v) is int and v > 0 for v in size):
         width, height = size
     try:
-        desktop_w, desktop_h = pygame.display.get_desktop_sizes()[0]
+        desktop_w, desktop_h = desktop_size()
         width, height = min(width, desktop_w), min(height, desktop_h)
     except Exception:
         pass
     return max(width, MIN_WIDTH), max(height, MIN_HEIGHT)
 
 
-DEFAULT_WINDOW_SIZE = (WIDTH, HEIGHT) # [F4] / the menu button goes back to this
+DEFAULT_WINDOW_SIZE = (WIDTH, HEIGHT)
 WIDTH, HEIGHT = initial_window_size()
+try:
+    window = create_window(WIDTH, HEIGHT, vsync=VSYNC, minimum_size=(MIN_WIDTH, MIN_HEIGHT))
+except Exception:
+    stream.close()
+    pa.terminate()
+    raise
 
-# Load fonts before showing a window so its event loop can start immediately.
-font = ui_font(18)
-small_font = ui_font(13)
-
-
-def open_gl_window():
-    """
-    SDL OpenGL 3.3 core window + moderngl context. All pygame drawing goes to an
-    offscreen surface which CRTRenderer uploads and composites every frame.
-    Returns (offscreen surface, renderer) or None if OpenGL is unavailable.
-    """
+font, small_font = ui.Font(18), ui.Font(13)
+screen, overlay = ui.Canvas((WIDTH, HEIGHT)), ui.Canvas((WIDTH, HEIGHT))
+pointer_position = (0, 0)
+gl_renderer = None
+if USE_OPENGL:
     try:
         import moderngl
         from crt_renderer import CRTRenderer
 
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
-        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
-        if sys.platform == 'darwin':
-            pygame.display.gl_set_attribute(pygame.GL_CONTEXT_FLAGS,
-                                            pygame.GL_CONTEXT_FORWARD_COMPATIBLE_FLAG)
-        pygame.display.gl_set_attribute(pygame.GL_DOUBLEBUFFER, 1)
-        pygame.display.set_mode(
-            (WIDTH, HEIGHT), pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE,
-            vsync=1 if VSYNC else 0,
-        )
-        renderer = CRTRenderer(moderngl.create_context(), WIDTH, HEIGHT)
+        gl_renderer = CRTRenderer(moderngl.create_context(), WIDTH, HEIGHT,
+                                 drawable_size=render_size((WIDTH, HEIGHT),
+                                                           window.get_framebuffer_size(), RETINA))
+        print(f"OpenGL: {gl_renderer.ctx.info['GL_RENDERER']} ({gl_renderer.ctx.info['GL_VERSION']})")
     except Exception as exc:
-        print(f"Warning: OpenGL renderer unavailable, CRT / GL line modes disabled ({exc})")
-        return None
+        print(f"Warning: ModernGL unavailable, using pyglet lines ({exc})")
 
-    print(f"OpenGL: {renderer.ctx.info['GL_RENDERER']} ({renderer.ctx.info['GL_VERSION']})")
-    return pygame.Surface((WIDTH, HEIGHT), 0, 32), renderer
-
-
-gl_renderer = None
-gl_window = open_gl_window() if USE_OPENGL else None
-
-if gl_window is not None:
-    screen, gl_renderer = gl_window
-    # text, labels and the menu: composited above the GL lines and the CRT beam
-    overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
-else:
-    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
-    overlay = screen # pygame draws everything in order: text is drawn last anyway
-
-pygame.display.set_caption("FluentScope Next")
-set_minimum_window_size(MIN_WIDTH, MIN_HEIGHT)
-
-clock = pygame.time.Clock()
 
 # ==========================
 # View State
@@ -1572,7 +1544,7 @@ detected_period = None
 theme_index = 0
 theme = THEMES[theme_index]
 
-trace_renderer = TRACE_RENDERER if gl_renderer is not None else "Pygame"
+trace_renderer = TRACE_RENDERER if gl_renderer is not None else "Pyglet"
 line_width = LINE_WIDTH
 line_aa = LINE_AA
 line_is_step = LINE_IS_STEP
@@ -1582,9 +1554,9 @@ spectrum_lines = [] # spectrum lines for the OpenGL line renderer, refilled ever
 def gl_line_queue():
     """
     Where plain lines (spectrum) go: a list drawn by the OpenGL line renderer, or
-    None to draw them with pygame (no ModernGL, or the Pygame renderer selected).
+    None to draw them with pyglet (no ModernGL, or the Pyglet renderer selected).
     """
-    if gl_renderer is None or trace_renderer == "Pygame":
+    if gl_renderer is None or trace_renderer == "Pyglet":
         return None
     return spectrum_lines
 crt_beam_width = CRT_BEAM_WIDTH
@@ -1615,7 +1587,7 @@ MENU_HINT = "Shift reverses supported controls or changes XY delay by x2 / x0.5.
 
 def layout_menu():
     global MENU_BUTTON
-    MENU_BUTTON = pygame.Rect(PLOT_WIDTH - 122, 6, 112, 24)
+    MENU_BUTTON = ui.Rect(PLOT_WIDTH - 122, 6, 112, 24)
 
 
 def update_layout():
@@ -1643,27 +1615,26 @@ def update_layout():
             SPEC_F_MIN, SPEC_F_MAX,
             SPEC_DB_MIN, SPEC_DB_MAX,
         )
+    old_waterfall = waterfall
     waterfall = Waterfall(*waterfall_size) if waterfall is None else waterfall.resized(*waterfall_size)
+    if old_waterfall is not None:
+        old_waterfall.image.delete()
     waterfall.rerender(theme["lut"])
     crt_scene = None # the phosphor was drawn for the old layout
 
 
 def apply_window_size(width, height):
-    """Follow a window resize: new drawing surfaces, GL render targets and layout."""
-    global WIDTH, HEIGHT, screen, overlay
+    """Keep layout in logical points and query native pixels independently."""
+    global WIDTH, HEIGHT
     width, height = max(1, int(width)), max(1, int(height))
+    if gl_renderer is not None:
+        gl_renderer.resize(width, height, drawable_size=render_size(
+            (width, height), window.get_framebuffer_size(), RETINA))
     if (width, height) == (WIDTH, HEIGHT):
         return
     WIDTH, HEIGHT = width, height
-    if gl_renderer is not None:
-        screen = pygame.Surface((WIDTH, HEIGHT), 0, 32)
-        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA, 32)
-        gl_renderer.resize(WIDTH, HEIGHT)
-    else:
-        screen = pygame.display.get_surface()
-        if screen is None or screen.get_size() != (WIDTH, HEIGHT):
-            screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
-        overlay = screen
+    screen.width, screen.height = WIDTH, HEIGHT
+    overlay.width, overlay.height = WIDTH, HEIGHT
     update_layout()
 
 
@@ -1745,10 +1716,13 @@ def apply_settings(data):
         set_theme(names.index(data["theme"]))
 
     if gl_renderer is not None:
-        if data.get("trace_renderer") in TRACE_RENDERERS:
-            trace_renderer = data["trace_renderer"]
+        renderer_name = data.get("trace_renderer")
+        if renderer_name == "Pygame":
+            renderer_name = "Pyglet"
+        if renderer_name in TRACE_RENDERERS:
+            trace_renderer = renderer_name
         elif isinstance(data.get("crt_enabled"), bool): # older settings files
-            trace_renderer = "CRT" if data["crt_enabled"] else "Pygame"
+            trace_renderer = "CRT" if data["crt_enabled"] else "Pyglet"
         value = number("line_width", 0.05, 64.0)
         if value is not None:
             line_width = float(value)
@@ -1772,6 +1746,8 @@ def apply_settings(data):
 
 def current_settings():
     data = dict(saved_settings) # keeps CRT values when OpenGL is unavailable this run
+    if data.get("trace_renderer") == "Pygame":
+        data["trace_renderer"] = "Pyglet"
     data.pop("scope_agc", None) # superseded by scope_agc_mode
     data.update({
         "view": VIEW_NAMES[view],
@@ -1795,6 +1771,7 @@ def current_settings():
         "window_size": [WIDTH, HEIGHT],
         "max_fps": FPS,
         "vsync": VSYNC,
+        "retina": RETINA,
     })
     if gl_renderer is not None:
         data.pop("crt_enabled", None) # superseded by trace_renderer
@@ -1841,7 +1818,7 @@ def draw_trace(waveform, color, top, height):
     )
 
     if points is not None:
-        pygame.draw.lines(screen, color, False, points, 2)
+        ui.lines(screen, color, False, points, 2)
 
 
 def draw_scope_graticule(lanes):
@@ -1849,8 +1826,8 @@ def draw_scope_graticule(lanes):
     center_x = round(right / 2)
     for division in range(11):
         x = round(right * division / 10)
-        pygame.draw.line(screen, theme["grid"], (x, 0), (x, bottom))
-    pygame.draw.line(screen, theme["center"], (center_x, 0), (center_x, bottom))
+        ui.line(screen, theme["grid"], (x, 0), (x, bottom))
+    ui.line(screen, theme["center"], (center_x, 0), (center_x, bottom))
 
     divisions = 8 // len(lanes)
     # Rebase by powers of two to keep the grid readable across the gain range.
@@ -1863,23 +1840,23 @@ def draw_scope_graticule(lanes):
         for division in range(-divisions // 2, divisions // 2 + 1):
             y = round(top + span * (0.5 + division * spacing / divisions))
             if top <= y <= lane_bottom:
-                pygame.draw.line(screen, theme["grid"], (0, y), (right, y))
-        pygame.draw.line(screen, theme["center"], (0, center_y), (right, center_y))
+                ui.line(screen, theme["grid"], (0, y), (right, y))
+        ui.line(screen, theme["center"], (0, center_y), (right, center_y))
 
         for subdivision in range(1, 50):
             x = round(right * subdivision / 50)
             tick = 5 if subdivision % 5 == 0 else 2
-            pygame.draw.line(screen, theme["center"], (x, center_y - tick), (x, center_y + tick))
+            ui.line(screen, theme["center"], (x, center_y - tick), (x, center_y + tick))
         half_ticks = divisions * 5 // 2
         for subdivision in range(1 - half_ticks, half_ticks):
             y = round(top + span * (0.5 + subdivision * spacing / (divisions * 5)))
             if not top <= y <= lane_bottom:
                 continue
             tick = 5 if subdivision % 5 == 0 else 2
-            pygame.draw.line(screen, theme["center"], (center_x - tick, y), (center_x + tick, y))
+            ui.line(screen, theme["center"], (center_x - tick, y), (center_x + tick, y))
 
     for top, _ in lanes[1:]:
-        pygame.draw.line(screen, theme["center"], (0, top), (right, top))
+        ui.line(screen, theme["center"], (0, top), (right, top))
 
 
 def draw_scope_dbfs_scale(top, height):
@@ -1888,7 +1865,7 @@ def draw_scope_dbfs_scale(top, height):
     bottom = top + height - 1
     upper = max(top, round(waveform_y(1, top, height, scope_gain)))
     lower = min(bottom, round(waveform_y(-1, top, height, scope_gain)))
-    pygame.draw.line(screen, theme["center"], (x, upper), (x, lower))
+    ui.line(screen, theme["center"], (x, upper), (x, lower))
 
     levels = (0, -3, -6, -12, -18)
     if scope_agc:
@@ -1905,7 +1882,7 @@ def draw_scope_dbfs_scale(top, height):
                     break
                 if last_label_y is not None and abs(y - last_label_y) < small_font.get_height():
                     break
-            pygame.draw.line(screen, theme["center"], (x - 4, y), (x + 4, y))
+            ui.line(screen, theme["center"], (x - 4, y), (x + 4, y))
             label = f"{db} dBFS" if scope_agc or db == 0 else str(db)
             text = small_font.render(label, True, theme["text"])
             rect = text.get_rect(midleft=(x + 7, y))
@@ -1929,7 +1906,7 @@ def draw_scope(traces):
         for top, height in lanes:
             draw_scope_dbfs_scale(top, height)
 
-    if trace_renderer == "Pygame": # otherwise drawn on the GPU in render_gl()
+    if trace_renderer == "Pyglet": # otherwise drawn on the GPU in render_gl()
         for waveform, color, top, height in traces:
             draw_trace(waveform, color, top, height)
 
@@ -1949,8 +1926,8 @@ def draw_spectrum_view():
     draw_spectrum(screen, analyzer, theme, 0, SPLIT_Y, True, gl_line_queue())
     draw_spectrum_labels(overlay, analyzer, theme, small_font, 0, SPLIT_Y, True)
 
-    screen.blit(waterfall.surface, (0, SPLIT_Y))
-    pygame.draw.line(screen, theme["center"], (0, SPLIT_Y), (PLOT_WIDTH, SPLIT_Y), 2)
+    screen.blit(waterfall.image, (0, SPLIT_Y))
+    ui.line(screen, theme["center"], (0, SPLIT_Y), (PLOT_WIDTH, SPLIT_Y), 2)
 
 
 def effective_lissajous_mode():
@@ -2017,16 +1994,16 @@ def draw_lissajous(points):
     # grid: 8 divisions, center cross, diagonals (mono / anti-phase lines in L/R)
     for i in range(1, 8):
         offset = side * i // 8
-        pygame.draw.line(screen, theme["grid"], (rect_left + offset, rect_top), (rect_left + offset, bottom))
-        pygame.draw.line(screen, theme["grid"], (rect_left, rect_top + offset), (right, rect_top + offset))
-    pygame.draw.line(screen, theme["grid"], (rect_left, bottom), (right, rect_top))
-    pygame.draw.line(screen, theme["grid"], (rect_left, rect_top), (right, bottom))
-    pygame.draw.line(screen, theme["center"], (mid_x, rect_top), (mid_x, bottom), 2)
-    pygame.draw.line(screen, theme["center"], (rect_left, mid_y), (right, mid_y), 2)
-    pygame.draw.rect(screen, theme["center"], (rect_left, rect_top, side, side), 1)
+        ui.line(screen, theme["grid"], (rect_left + offset, rect_top), (rect_left + offset, bottom))
+        ui.line(screen, theme["grid"], (rect_left, rect_top + offset), (right, rect_top + offset))
+    ui.line(screen, theme["grid"], (rect_left, bottom), (right, rect_top))
+    ui.line(screen, theme["grid"], (rect_left, rect_top), (right, bottom))
+    ui.line(screen, theme["center"], (mid_x, rect_top), (mid_x, bottom), 2)
+    ui.line(screen, theme["center"], (rect_left, mid_y), (right, mid_y), 2)
+    ui.rect(screen, theme["center"], (rect_left, rect_top, side, side), 1)
 
     if points is not None and len(points) > 1:
-        pygame.draw.lines(screen, theme["trace"], False, points, 1)
+        ui.lines(screen, theme["trace"], False, points, 1)
 
     # axis labels
     if effective_lissajous_mode() == "Auto":
@@ -2176,14 +2153,13 @@ def line_lissajous(left, right, mix):
     gl_renderer.draw_line(points, color01(theme["trace"]), scissor=(rect_left, rect_top, side, side))
 
 
-def render_gl(traces, left, right, mix, end_abs):
-    """Upload the pygame-drawn UI, add the traces (CRT / GL line) and composite to the window."""
+def render_gl(traces, left, right, mix, end_abs, dt):
+    """Draw the UI target, add traces, and composite to the native framebuffer."""
 
     global crt_scene, lissajous_beam_end
 
     r = gl_renderer
-    r.upload_ui(screen)
-    r.upload_overlay(overlay)
+    screen.render(window, target=r.ui_fbo, framebuffer_size=(r.width, r.height))
     trace_view = view in (VIEW_SCOPE, VIEW_LISSAJOUS)
 
     # plain line layer: spectrum, then the GL Line traces on top
@@ -2204,7 +2180,7 @@ def render_gl(traces, left, right, mix, end_abs):
     if not (trace_renderer == "CRT" and trace_view):
         crt_scene = None
         lissajous_beam_end = None
-        r.present(False)
+        r.present(False, framebuffer_size=window.get_framebuffer_size())
         return
 
     scene = (view, stereo_mode, theme_index, effective_lissajous_mode(), lissajous_swap,
@@ -2232,7 +2208,7 @@ def render_gl(traces, left, right, mix, end_abs):
         beam_scope(traces)
     else:
         beam_lissajous(left, right, mix, end_abs)
-    r.present(True)
+    r.present(True, framebuffer_size=window.get_framebuffer_size())
 
 
 def step_option(options, current, step):
@@ -2258,9 +2234,9 @@ def cycle(options, current):
 
 def scale_controls():
     return (
-        (pygame.K_j, "J", "Grid", show_scope_graticule),
-        (pygame.K_k, "K", "Fixed dBFS", show_scope_dbfs_scale),
-        (pygame.K_d, "D", "AGC dBFS", show_scope_agc_dbfs_scale),
+        (key.J, "J", "Grid", show_scope_graticule),
+        (key.K, "K", "Fixed dBFS", show_scope_dbfs_scale),
+        (key.D, "D", "AGC dBFS", show_scope_agc_dbfs_scale),
     )
 
 
@@ -2273,48 +2249,50 @@ def menu_items():
     hold = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "Off"
     groups = [
         ("Display", (
-            (pygame.K_TAB, "Tab", f"View: {VIEW_NAMES[view]}"),
-            (pygame.K_t, "T", f"Theme: {theme['name']}"),
-            (pygame.K_s, "S", f"Spectrum overlay: {'On' if show_overlay else 'Off'}"),
-            (pygame.K_r, "R", f"Trigger: {trigger_mode}"),
-            (pygame.K_m, "M", f"Stereo: {stereo_mode}"),
-            (pygame.K_F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
-            (pygame.K_F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
-            (pygame.K_F4, "F4", "Reset size ({}x{})".format(*DEFAULT_WINDOW_SIZE)),
-            (pygame.K_F5, "F5", f"Max FPS: {format_fps(FPS)}{' (VSync)' if VSYNC else ''}"),
-            (pygame.K_F6, "F6", f"VSync: {'On' if VSYNC else 'Off'}"),
+            (key.TAB, "Tab", f"View: {VIEW_NAMES[view]}"),
+            (key.T, "T", f"Theme: {theme['name']}"),
+            (key.S, "S", f"Spectrum overlay: {'On' if show_overlay else 'Off'}"),
+            (key.R, "R", f"Trigger: {trigger_mode}"),
+            (key.M, "M", f"Stereo: {stereo_mode}"),
+            (key.F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
+            (key.F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
+            (key.F4, "F4", "Reset size ({}x{})".format(*DEFAULT_WINDOW_SIZE)),
+            (key.F5, "F5", f"Max FPS: {format_fps(FPS)}{' (VSync)' if VSYNC else ''}"),
+            (key.F6, "F6", f"VSync: {'On' if VSYNC else 'Off'}"),
+            *([(key.F7, "F7", f"Retina resolution: {'On' if RETINA else 'Off'}")]
+              if sys.platform == 'darwin' and gl_renderer is not None else []),
         )),
         ("Scope", (
-            (pygame.K_x, "X", f"Time span: {scope_time_span()}"),
-            (pygame.K_p, "P", f"Line: {'Step' if line_is_step else 'Smooth'}"),
-            (pygame.K_a, "A", f"AGC: {agc}"),
-            (pygame.K_h, "H", f"AGC peak hold: {hold}"),
+            (key.X, "X", f"Time span: {scope_time_span()}"),
+            (key.P, "P", f"Line: {'Step' if line_is_step else 'Smooth'}"),
+            (key.A, "A", f"AGC: {agc}"),
+            (key.H, "H", f"AGC peak hold: {hold}"),
             *((key, shortcut, f"{name}: {'On' if enabled else 'Off'}")
               for key, shortcut, name, enabled in scale_controls()),
         )),
         ("Lissajous", (
-            (pygame.K_l, "L", f"XY mode: {lissajous_mode}"),
-            (pygame.K_w, "W", f"Swap X/Y: {'On' if lissajous_swap else 'Off'}"),
-            (pygame.K_i, "I", f"Invert: {lissajous_invert}"),
-            (pygame.K_a, "A", f"AGC: {agc}"),
-            (pygame.K_COMMA, ",", "Decrease XY delay"),
-            (pygame.K_PERIOD, ".", "Increase XY delay"),
+            (key.L, "L", f"XY mode: {lissajous_mode}"),
+            (key.W, "W", f"Swap X/Y: {'On' if lissajous_swap else 'Off'}"),
+            (key.I, "I", f"Invert: {lissajous_invert}"),
+            (key.A, "A", f"AGC: {agc}"),
+            (key.COMMA, ",", "Decrease XY delay"),
+            (key.PERIOD, ".", "Increase XY delay"),
         )),
     ]
     if gl_renderer is not None:
-        items = [(pygame.K_c, "C", f"Renderer: {trace_renderer}")]
+        items = [(key.C, "C", f"Renderer: {trace_renderer}")]
         if trace_renderer == "CRT":
             items += [
-                (pygame.K_e, "E", f"Exposure: {crt_exposure:.2f}"),
-                (pygame.K_f, "F", f"Focus: {crt_beam_width:.1f}px"),
-                (pygame.K_g, "G", f"Afterglow: {format_seconds(crt_persistence)}"),
-                (pygame.K_b, "B", f"Bloom: {'On' if crt_bloom else 'Off'}"),
-                (pygame.K_v, "V", f"Gamma: {crt_gamma:.1f}"),
+                (key.E, "E", f"Exposure: {crt_exposure:.2f}"),
+                (key.F, "F", f"Focus: {crt_beam_width:.1f}px"),
+                (key.G, "G", f"Afterglow: {format_seconds(crt_persistence)}"),
+                (key.B, "B", f"Bloom: {'On' if crt_bloom else 'Off'}"),
+                (key.V, "V", f"Gamma: {crt_gamma:.1f}"),
             ]
-        if trace_renderer != "Pygame": # GL lines: traces in GL Line mode, spectrum in both
+        if trace_renderer != "Pyglet": # GL lines: traces in GL Line mode, spectrum in both
             items += [
-                (pygame.K_n, "N", f"Line width: {format_line_width(line_width)}"),
-                (pygame.K_o, "O", f"Anti-aliasing: {'On' if line_aa else 'Off'}"),
+                (key.N, "N", f"Line width: {format_line_width(line_width)}"),
+                (key.O, "O", f"Anti-aliasing: {'On' if line_aa else 'Off'}"),
             ]
         groups.append(("Renderer", tuple(items)))
     return groups
@@ -2361,12 +2339,12 @@ def menu_layout():
             x = left + MENU_PADDING + column * (column_width + MENU_COLUMN_GAP)
             titles.append((title, (x + 4, y + 7)))
             for row, (key, shortcut, text) in enumerate(items):
-                rect = pygame.Rect(x, y + 32 + MENU_ROW_HEIGHT * row, column_width, MENU_ROW_HEIGHT - 1)
+                rect = ui.Rect(x, y + 32 + MENU_ROW_HEIGHT * row, column_width, MENU_ROW_HEIGHT - 1)
                 rows.append((key, f"[{shortcut}] {text}", rect))
         y += 32 + MENU_ROW_HEIGHT * max(len(items) for _, items in band_groups) + 4
     height = y - top + 12 + small_font.get_linesize() * len(hint)
     # a window too short for the whole panel cuts it off (rows below stay unreachable)
-    panel = pygame.Rect(left, top, width, max(1, min(height, HEIGHT - top - 4)))
+    panel = ui.Rect(left, top, width, max(1, min(height, HEIGHT - top - 4)))
     rows = [row for row in rows if panel.contains(row[2])]
     return panel, titles, rows, hint
 
@@ -2380,8 +2358,8 @@ def menu_key_at(pos):
 
 
 def draw_button(rect, text):
-    pygame.draw.rect(overlay, theme["bg"], rect)
-    pygame.draw.rect(overlay, theme["center"], rect, 1)
+    ui.rect(overlay, theme["bg"], rect)
+    ui.rect(overlay, theme["center"], rect, 1)
     label = small_font.render(text, True, theme["text"])
     overlay.blit(label, label.get_rect(center=rect.center))
 
@@ -2393,14 +2371,14 @@ def draw_menu():
         return
 
     panel, titles, rows, hint = menu_layout()
-    pygame.draw.rect(overlay, theme["bg"], panel)
+    ui.rect(overlay, theme["bg"], panel)
     overlay.set_clip(panel)
-    pointer = pygame.mouse.get_pos()
+    pointer = pointer_position
     for title, pos in titles:
         overlay.blit(font.render(title, True, theme["text"]), pos)
     for _, label, rect in rows:
         if rect.collidepoint(pointer):
-            pygame.draw.rect(overlay, theme["grid"], rect)
+            ui.rect(overlay, theme["grid"], rect)
         overlay.blit(small_font.render(label, True, theme["text"]), (rect.x + 4, rect.y + 2))
     line_height = small_font.get_linesize()
     y = panel.bottom - 8 - line_height * len(hint)
@@ -2408,12 +2386,12 @@ def draw_menu():
         overlay.blit(small_font.render(line, True, theme["text"]), (panel.x + 14, y))
         y += line_height
     overlay.set_clip(None)
-    pygame.draw.rect(overlay, theme["center"], panel, 1)
+    ui.rect(overlay, theme["center"], panel, 1)
 
 
 def hud_texts(detected_period):
     """Status lines, top to bottom, as (font, text); fields are separated by 3 spaces."""
-    texts = [(font, f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{clock.get_fps():.1f}   Max:{'VSync' if VSYNC else format_fps(FPS)}")]
+    texts = [(font, f"Rate:{RATE}Hz   FFT:{FFT_SIZE}   FPS:{frame_fps:.1f}   Max:{'VSync' if VSYNC else format_fps(FPS)}")]
 
     if trigger_mode in ("FFT", "Hybrid", "Corr"):
         trigger_info = f"{trigger_mode} ({RATE / detected_period:.1f}Hz)" if detected_period else f"{trigger_mode} (no lock)"
@@ -2456,7 +2434,7 @@ def hud_texts(detected_period):
                 f"   AA:{'ON' if line_aa else 'OFF'}"
             )
         else:
-            renderer_text = "Renderer:Pygame"
+            renderer_text = "Renderer:Pyglet"
         texts.append((small_font, renderer_text))
 
     if view == VIEW_SCOPE:
@@ -2486,7 +2464,7 @@ def layout_hud(texts):
         right = MENU_BUTTON.x - 10 if index == 0 else PLOT_WIDTH - 10
         for line in wrap_words(text, text_font, right - 10, separator="   "):
             lines.append((text_font, line, (10, y)))
-            y += text_font.get_linesize() if index == 0 else 15
+            y += text_font.get_linesize()
         if index == 0:
             y = max(y, 32)
     return lines
@@ -2496,27 +2474,33 @@ def format_fps(value):
     return "Unlimited" if value == 0 else str(value)
 
 
-def set_vsync(enabled):
-    """Switch VSync in place: the GL swap interval, or a recreated plain window."""
-    global VSYNC
-    if gl_renderer is not None:
-        if not set_gl_swap_interval(1 if enabled else 0):
-            return
-        VSYNC = enabled
+def schedule_frames():
+    pyglet.clock.unschedule(draw_frame)
+    if VSYNC or FPS == 0:
+        pyglet.clock.schedule(draw_frame)
     else:
-        VSYNC = enabled
-        pygame.display.set_mode((WIDTH, HEIGHT), pygame.RESIZABLE, vsync=1 if VSYNC else 0)
-        apply_window_size(*pygame.display.get_window_size())
+        pyglet.clock.schedule_interval(draw_frame, 1.0 / FPS)
+
+
+def set_vsync(enabled):
+    global VSYNC
+    window.set_vsync(enabled)
+    VSYNC = enabled
+    schedule_frames()
 
 
 def reset_window_size():
-    """Back to DEFAULT_WINDOW_SIZE (un-maximizes first)."""
-    if gl_renderer is None:
-        # a plain window can simply be recreated at the new size
-        pygame.display.set_mode(DEFAULT_WINDOW_SIZE, pygame.RESIZABLE, vsync=1 if VSYNC else 0)
-    elif not resize_window(*DEFAULT_WINDOW_SIZE):
-        return # would need a new GL context; leave the window as it is
-    apply_window_size(*pygame.display.get_window_size())
+    window.set_fullscreen(False)
+    window.set_size(*DEFAULT_WINDOW_SIZE)
+    apply_window_size(*window.get_size())
+
+
+def set_retina(enabled):
+    global RETINA, crt_scene
+    if sys.platform == 'darwin' and gl_renderer is not None:
+        RETINA = enabled
+        apply_window_size(*window.get_size())
+        crt_scene = None
 
 
 # ==========================
@@ -2533,162 +2517,191 @@ print(r"""     ______              __  ____
 print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
 print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button  [F4] Reset window size")
 print("        [F5] Max FPS (+Shift: back)  [F6] VSync")
+if sys.platform == 'darwin' and gl_renderer is not None:
+    print("        [F7] Retina resolution")
 print("        [A] AGC Off/High/Med/Low (Scope & Lissajous)  [D] AGC dBFS labels  [H] AGC peak hold")
 print("        [J] Scope grid  [K] Fixed-gain dBFS labels")
 print("        [X]/[Shift+X] Scope time span  [P] Scope step / smooth line")
 print("        [W] Lissajous swap X/Y  [I] invert Off/X/Y/XY (+Shift: back)")
 print("        [L] Lissajous L/R <-> Auto  [,] [.] (or [ and ]) autocorrelation delay -1 / +1 (+Shift: x0.5 / x2)")
 if gl_renderer is not None:
-    print("        [C] renderer CRT / GL Line / Pygame (+Shift: back)")
+    print("        [C] renderer CRT / GL Line / Pyglet (+Shift: back)")
     print("        CRT:     [E] exposure  [F] focus  [G] afterglow  [V] gamma (+Shift: down)  [B] bloom")
     print("        Lines:   [N] line width (+Shift: thinner)  [O] anti-aliasing (GL Line traces, spectrum)")
 
-running = True
-dt = 0.0
-focus_window()
+frame_fps = 0.0
 
-while running:
 
-    window_resized = False
+def handle_key(symbol, modifiers):
+    global menu_open, show_level_meter, show_hud, FPS, view, lissajous_mode
+    global lissajous_delay, lissajous_swap, lissajous_invert, show_overlay, trigger_mode
+    global stereo_mode, scope_gain, scope_held_peak, scope_hold_remaining, scope_samples
+    global scope_agc_mode, lissajous_gain, show_scope_agc_dbfs_scale, show_scope_graticule
+    global show_scope_dbfs_scale, line_is_step, scope_agc_peak_hold, trace_renderer
+    global line_width, line_aa, crt_persistence, crt_beam_width, crt_exposure, crt_bloom, crt_gamma
+    old_fps = FPS
+    if symbol == key.F1:
+        menu_open = not menu_open
+        return pyglet.event.EVENT_HANDLED
+    elif symbol == key.ESCAPE and menu_open:
+        menu_open = False
+        return pyglet.event.EVENT_HANDLED
+    elif symbol == key.F2:
+        show_level_meter = not show_level_meter
+        update_layout()
+    elif symbol == key.F3:
+        show_hud = not show_hud
+        layout_menu()
+    elif symbol == key.F4:
+        reset_window_size()
+    elif symbol == key.F5:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        FPS = FPS_OPTIONS[(FPS_OPTIONS.index(FPS) + step) % len(FPS_OPTIONS)] \
+            if FPS in FPS_OPTIONS else FPS_OPTIONS[0]
+    elif symbol == key.F6:
+        set_vsync(not VSYNC)
+    elif symbol == key.F7:
+        set_retina(not RETINA)
+    elif symbol == key.TAB:
+        view = (view + 1) % len(VIEW_NAMES)
+    elif symbol == key._1:
+        view = VIEW_SCOPE
+    elif symbol == key._2:
+        view = VIEW_SPECTRUM
+    elif symbol == key._3:
+        view = VIEW_LISSAJOUS
+    elif symbol == key.L:
+        lissajous_mode = cycle(LISSAJOUS_MODES, lissajous_mode)
+    elif symbol in (key.BRACKETLEFT, key.BRACKETRIGHT, key.COMMA, key.PERIOD):
+        # autocorrelation delay: x2 / x0.5 with Shift, otherwise +-1 sample.
+        # [ ] or , . (the latter sit at the same place on US and JIS keyboards)
+        up = symbol in (key.BRACKETRIGHT, key.PERIOD)
+        if view == VIEW_LISSAJOUS and lissajous_mode != "Auto":
+            lissajous_mode = "Auto" # the delay only exists in Auto mode
+        if modifiers & key.MOD_SHIFT:
+            lissajous_delay = lissajous_delay * 2 if up else lissajous_delay // 2
+        else:
+            lissajous_delay += 1 if up else -1
+        lissajous_delay = min(max(lissajous_delay, LISSAJOUS_DELAY_MIN), LISSAJOUS_DELAY_MAX)
+    elif symbol == key.W:
+        lissajous_swap = not lissajous_swap
+    elif symbol == key.I:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        index = LISSAJOUS_INVERTS.index(lissajous_invert) + step
+        lissajous_invert = LISSAJOUS_INVERTS[index % len(LISSAJOUS_INVERTS)]
+    elif symbol == key.S:
+        show_overlay = not show_overlay
+    elif symbol == key.T:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        set_theme(theme_index + step)
+    elif symbol == key.R:
+        trigger_mode = cycle(TRIGGER_MODES, trigger_mode)
+    elif symbol == key.M:
+        stereo_mode = cycle(STEREO_MODES, stereo_mode)
+        scope_gain = SCOPE_GAIN
+        scope_held_peak, scope_hold_remaining = 0.0, 0.0
+    elif symbol == key.X:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        index = SCOPE_SAMPLE_COUNTS.index(scope_samples) + step
+        scope_samples = SCOPE_SAMPLE_COUNTS[index % len(SCOPE_SAMPLE_COUNTS)]
+        for triggers in (hybrid_triggers, corr_triggers, legacy_triggers, diff_triggers):
+            triggers.clear()
+    elif symbol == key.A:
+        scope_agc_mode = cycle(SCOPE_AGC_MODES, scope_agc_mode)
+        if scope_agc_mode == "Off":
+            scope_gain = SCOPE_GAIN
+            lissajous_gain = LISSAJOUS_GAIN
+    elif symbol == key.D:
+        show_scope_agc_dbfs_scale = not show_scope_agc_dbfs_scale
+    elif symbol == key.J:
+        show_scope_graticule = not show_scope_graticule
+    elif symbol == key.K:
+        show_scope_dbfs_scale = not show_scope_dbfs_scale
+    elif symbol == key.P:
+        line_is_step = not line_is_step
+    elif symbol == key.H:
+        scope_agc_peak_hold = not scope_agc_peak_hold
+        scope_held_peak, scope_hold_remaining = 0.0, 0.0
+    elif gl_renderer is not None:
+        # renderer / CRT beam / GL line controls (Shift = the other direction)
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        if symbol == key.C:
+            index = TRACE_RENDERERS.index(trace_renderer) + step
+            trace_renderer = TRACE_RENDERERS[index % len(TRACE_RENDERERS)]
+        elif symbol == key.N:
+            line_width = step_option(LINE_WIDTHS, line_width, step)
+        elif symbol == key.O:
+            line_aa = not line_aa
+        elif symbol == key.G:
+            crt_persistence = step_option(CRT_PERSISTENCES, crt_persistence, step)
+        elif symbol == key.F:
+            crt_beam_width = step_option(CRT_BEAM_WIDTHS, crt_beam_width, step)
+        elif symbol == key.E:
+            crt_exposure *= CRT_EXPOSURE_STEP ** step
+            crt_exposure = min(max(crt_exposure, 0.05), 100.0)
+        elif symbol == key.B:
+            crt_bloom = not crt_bloom
+        elif symbol == key.V:
+            crt_gamma = step_option(CRT_GAMMAS, crt_gamma, step)
 
-    for event in pygame.event.get():
+    if FPS != old_fps:
+        schedule_frames()
+    save_settings_if_changed()
+    return pyglet.event.EVENT_HANDLED
 
-        if event.type in (pygame.VIDEORESIZE, pygame.WINDOWSIZECHANGED):
-            window_resized = True
-            continue
 
-        if event.type == pygame.WINDOWTAKEFOCUS:
-            focus_window()
-            continue
+@window.event
+def on_key_press(symbol, modifiers):
+    return handle_key(symbol, modifiers)
 
-        if event.type == pygame.MOUSEBUTTONDOWN and not pygame.key.get_focused():
-            focus_window()
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if show_hud and MENU_BUTTON.collidepoint(event.pos):
-                menu_open = not menu_open
-                continue
-            if menu_open:
-                inside, key = menu_key_at(event.pos)
-                if key is None:
-                    if not inside:
-                        menu_open = False
-                    continue
-                event = pygame.event.Event(pygame.KEYDOWN, key=key, mod=pygame.key.get_mods())
+@window.event
+def on_mouse_motion(x, y, dx, dy):
+    global pointer_position
+    pointer_position = mouse_position(x, y, HEIGHT)
 
-        if event.type == pygame.QUIT:
-            running = False
 
-        elif event.type == pygame.KEYDOWN:
+@window.event
+def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
+    on_mouse_motion(x, y, dx, dy)
 
-            if event.key == pygame.K_F1:
-                menu_open = not menu_open
-                continue
-            elif event.key == pygame.K_ESCAPE and menu_open:
-                menu_open = False
-                continue
-            elif event.key == pygame.K_F2:
-                show_level_meter = not show_level_meter
-                update_layout()
-            elif event.key == pygame.K_F3:
-                show_hud = not show_hud
-                layout_menu()
-            elif event.key == pygame.K_F4:
-                reset_window_size()
-            elif event.key == pygame.K_F5:
-                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
-                FPS = FPS_OPTIONS[(FPS_OPTIONS.index(FPS) + step) % len(FPS_OPTIONS)] \
-                    if FPS in FPS_OPTIONS else FPS_OPTIONS[0]
-            elif event.key == pygame.K_F6:
-                set_vsync(not VSYNC)
-            elif event.key == pygame.K_TAB:
-                view = (view + 1) % len(VIEW_NAMES)
-            elif event.key == pygame.K_1:
-                view = VIEW_SCOPE
-            elif event.key == pygame.K_2:
-                view = VIEW_SPECTRUM
-            elif event.key == pygame.K_3:
-                view = VIEW_LISSAJOUS
-            elif event.key == pygame.K_l:
-                lissajous_mode = cycle(LISSAJOUS_MODES, lissajous_mode)
-            elif event.key in (pygame.K_LEFTBRACKET, pygame.K_RIGHTBRACKET, pygame.K_COMMA, pygame.K_PERIOD):
-                # autocorrelation delay: x2 / x0.5 with Shift, otherwise +-1 sample.
-                # [ ] or , . (the latter sit at the same place on US and JIS keyboards)
-                up = event.key in (pygame.K_RIGHTBRACKET, pygame.K_PERIOD)
-                if view == VIEW_LISSAJOUS and lissajous_mode != "Auto":
-                    lissajous_mode = "Auto" # the delay only exists in Auto mode
-                if event.mod & pygame.KMOD_SHIFT:
-                    lissajous_delay = lissajous_delay * 2 if up else lissajous_delay // 2
-                else:
-                    lissajous_delay += 1 if up else -1
-                lissajous_delay = min(max(lissajous_delay, LISSAJOUS_DELAY_MIN), LISSAJOUS_DELAY_MAX)
-            elif event.key == pygame.K_w:
-                lissajous_swap = not lissajous_swap
-            elif event.key == pygame.K_i:
-                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
-                index = LISSAJOUS_INVERTS.index(lissajous_invert) + step
-                lissajous_invert = LISSAJOUS_INVERTS[index % len(LISSAJOUS_INVERTS)]
-            elif event.key == pygame.K_s:
-                show_overlay = not show_overlay
-            elif event.key == pygame.K_t:
-                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
-                set_theme(theme_index + step)
-            elif event.key == pygame.K_r:
-                trigger_mode = cycle(TRIGGER_MODES, trigger_mode)
-            elif event.key == pygame.K_m:
-                stereo_mode = cycle(STEREO_MODES, stereo_mode)
-                scope_gain = SCOPE_GAIN
-                scope_held_peak, scope_hold_remaining = 0.0, 0.0
-            elif event.key == pygame.K_x:
-                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
-                index = SCOPE_SAMPLE_COUNTS.index(scope_samples) + step
-                scope_samples = SCOPE_SAMPLE_COUNTS[index % len(SCOPE_SAMPLE_COUNTS)]
-                for triggers in (hybrid_triggers, corr_triggers, legacy_triggers, diff_triggers):
-                    triggers.clear()
-            elif event.key == pygame.K_a:
-                scope_agc_mode = cycle(SCOPE_AGC_MODES, scope_agc_mode)
-                if scope_agc_mode == "Off":
-                    scope_gain = SCOPE_GAIN
-                    lissajous_gain = LISSAJOUS_GAIN
-            elif event.key == pygame.K_d:
-                show_scope_agc_dbfs_scale = not show_scope_agc_dbfs_scale
-            elif event.key == pygame.K_j:
-                show_scope_graticule = not show_scope_graticule
-            elif event.key == pygame.K_k:
-                show_scope_dbfs_scale = not show_scope_dbfs_scale
-            elif event.key == pygame.K_p:
-                line_is_step = not line_is_step
-            elif event.key == pygame.K_h:
-                scope_agc_peak_hold = not scope_agc_peak_hold
-                scope_held_peak, scope_hold_remaining = 0.0, 0.0
-            elif gl_renderer is not None:
-                # renderer / CRT beam / GL line controls (Shift = the other direction)
-                step = -1 if event.mod & pygame.KMOD_SHIFT else 1
-                if event.key == pygame.K_c:
-                    index = TRACE_RENDERERS.index(trace_renderer) + step
-                    trace_renderer = TRACE_RENDERERS[index % len(TRACE_RENDERERS)]
-                elif event.key == pygame.K_n:
-                    line_width = step_option(LINE_WIDTHS, line_width, step)
-                elif event.key == pygame.K_o:
-                    line_aa = not line_aa
-                elif event.key == pygame.K_g:
-                    crt_persistence = step_option(CRT_PERSISTENCES, crt_persistence, step)
-                elif event.key == pygame.K_f:
-                    crt_beam_width = step_option(CRT_BEAM_WIDTHS, crt_beam_width, step)
-                elif event.key == pygame.K_e:
-                    crt_exposure *= CRT_EXPOSURE_STEP ** step
-                    crt_exposure = min(max(crt_exposure, 0.05), 100.0)
-                elif event.key == pygame.K_b:
-                    crt_bloom = not crt_bloom
-                elif event.key == pygame.K_v:
-                    crt_gamma = step_option(CRT_GAMMAS, crt_gamma, step)
 
-            save_settings_if_changed() # auto-save whenever a key changed a setting
+@window.event
+def on_mouse_press(x, y, button, modifiers):
+    global menu_open
+    on_mouse_motion(x, y, 0, 0)
+    if button != mouse.LEFT:
+        return
+    if show_hud and MENU_BUTTON.collidepoint(pointer_position):
+        menu_open = not menu_open
+    elif menu_open:
+        inside, symbol = menu_key_at(pointer_position)
+        if symbol is not None:
+            handle_key(symbol, modifiers)
+        elif not inside:
+            menu_open = False
 
-    if window_resized:
-        apply_window_size(*pygame.display.get_window_size())
-        save_settings_if_changed() # remember the window size
 
+@window.event
+def on_resize(width, height):
+    apply_window_size(width, height)
+    save_settings_if_changed()
+
+
+@window.event
+def on_close():
+    save_settings_if_changed()
+    pyglet.app.exit()
+    return pyglet.event.EVENT_HANDLED
+
+
+def draw_frame(dt):
+    global scope_gain, scope_held_peak, scope_hold_remaining, lissajous_gain
+    global lissajous_held_peak, lissajous_hold_remaining, hud_bottom, detected_period, frame_fps
+    window.switch_to()
+    apply_window_size(*window.get_size())
+    if dt > 0:
+        frame_fps = 0.9 * frame_fps + 0.1 / dt if frame_fps else 1 / dt
     if not stream.is_active():
         recover_audio_stream()
 
@@ -2726,8 +2739,7 @@ while running:
     #
 
     screen.fill(theme["bg"])
-    if overlay is not screen:
-        overlay.fill((0, 0, 0, 0))
+    overlay.fill((0, 0, 0, 0))
 
     if view == VIEW_SCOPE and scope_agc_mode != "Off":
         peak = max(float(np.max(np.abs(waveform), initial=0.0)) for waveform, _, _, _ in traces)
@@ -2761,7 +2773,7 @@ while running:
     if view == VIEW_SCOPE:
         draw_scope(traces)
     elif view == VIEW_LISSAJOUS:
-        draw_lissajous(build_lissajous_points(left, right, mix) if trace_renderer == "Pygame" else None)
+        draw_lissajous(build_lissajous_points(left, right, mix) if trace_renderer == "Pyglet" else None)
     else:
         draw_spectrum_view()
 
@@ -2781,30 +2793,30 @@ while running:
 
     draw_menu()
     if gl_renderer is not None:
-        render_gl(traces, left, right, mix, end_abs)
-
-    pygame.display.flip()
-
-    if VSYNC or FPS == 0:
-        dt = clock.tick() / 1000.0
+        render_gl(traces, left, right, mix, end_abs, dt)
     else:
-        dt = clock.tick(FPS) / 1000.0
+        screen.render(window)
+    overlay.render(window, clear=False)
+    window.flip()
 
-# ==========================
-# Shutdown
-# ==========================
 
+
+window.set_visible(True)
+window.activate()
+schedule_frames()
 try:
-    if stream.is_active():
-        stream.stop_stream()
-except Exception:
+    pyglet.app.run(interval=None)
+finally:
+    pyglet.clock.unschedule(draw_frame)
     try:
-        stream.abort_stream()
-    except Exception:
-        pass
-
-stream.close()
-
-pa.terminate()
-
-pygame.quit()
+        if stream.is_active():
+            stream.stop_stream()
+    finally:
+        stream.close()
+        pa.terminate()
+        screen.delete()
+        overlay.delete()
+        waterfall.image.delete()
+        if gl_renderer is not None:
+            gl_renderer.release()
+        window.close()
