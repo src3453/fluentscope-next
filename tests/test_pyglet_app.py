@@ -130,9 +130,36 @@ class PygletAppTests(unittest.TestCase):
                 saved = json.load(settings)
             test.assertEqual(saved['trace_renderer'], state['trace_renderer'])
             test.assertEqual(saved['window_size'], list(state['DEFAULT_WINDOW_SIZE']))
-            # Run pyglet's actual event loop too, then exercise normal shutdown.
-            pyglet.clock.schedule_once(lambda dt: state['on_close'](), 0.05)
+            # Check focus after Cocoa's real event loop has finished launching.
+            # A topmost window alone does not prove it can receive keyboard input.
+            focus_errors = []
+
+            def check_focus_and_close(dt):
+                try:
+                    if sys.platform == 'darwin':
+                        from pyglet.libs.darwin import cocoapy
+                        app = cocoapy.ObjCClass('NSApplication').sharedApplication()
+                        test.assertTrue(app.isActive())
+                        test.assertTrue(window._nswindow.isKeyWindow())
+                        for restore in (state['on_activate'], state['on_show'],
+                                        lambda: state['on_mouse_press'](0, 0, state['mouse'].RIGHT, 0)):
+                            window._nswindow.makeFirstResponder_(None)
+                            restore()
+                            responder = window._nswindow.firstResponder()
+                            test.assertEqual(responder.ptr.value, window._nsview.ptr.value)
+                        # Moving over the window must not issue a focus request.
+                        with patch.dict(state, {'activate_window': Mock()}) as patched:
+                            state['on_mouse_motion'](10, 10, 1, 1)
+                            patched['activate_window'].assert_not_called()
+                except BaseException as exc:
+                    focus_errors.append(exc)
+                finally:
+                    state['on_close']()
+
+            pyglet.clock.schedule_once(check_focus_and_close, 0.15)
             original_run(interval=None)
+            if focus_errors:
+                raise focus_errors[0]
             test.assertNotIn('pygame', sys.modules)
 
         repo = Path(__file__).resolve().parents[1]

@@ -1,16 +1,75 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from window_support import configure_windowing, create_window, mouse_position, render_size
+from window_support import activate_window, configure_windowing, create_window, mouse_position, render_size
 
 
 class WindowSupportTests(unittest.TestCase):
+    def cocoa(self):
+        cocoa = Mock()
+        app = cocoa.ObjCClass.return_value.sharedApplication.return_value
+        app.isActive.return_value = False
+        cocoa.get_selector.return_value = 'activate'
+        return cocoa, app
+
+    def test_cocoa_focus_restores_app_key_window_and_first_responder(self):
+        cocoa, app = self.cocoa()
+        window = Mock()
+        with patch('window_support.sys.platform', 'darwin'), \
+                patch.dict('sys.modules', {'pyglet.libs.darwin': Mock(cocoapy=cocoa)}):
+            activate_window(window)
+        app.activate.assert_called_once_with()
+        app.activateIgnoringOtherApps_.assert_not_called()
+        window._nswindow.makeKeyAndOrderFront_.assert_called_once_with(None)
+        window._nswindow.makeFirstResponder_.assert_called_once_with(window._nsview)
+
+    def test_active_cocoa_app_only_restores_window_and_input_view(self):
+        cocoa, app = self.cocoa()
+        app.isActive.return_value = True
+        with patch('window_support.sys.platform', 'darwin'), \
+                patch.dict('sys.modules', {'pyglet.libs.darwin': Mock(cocoapy=cocoa)}):
+            activate_window(Mock())
+        app.activate.assert_not_called()
+        app.activateIgnoringOtherApps_.assert_not_called()
+
+    def test_older_cocoa_uses_legacy_activation(self):
+        cocoa, app = self.cocoa()
+        app.respondsToSelector_.return_value = False
+        with patch('window_support.sys.platform', 'darwin'), \
+                patch.dict('sys.modules', {'pyglet.libs.darwin': Mock(cocoapy=cocoa)}):
+            activate_window(Mock())
+        app.activateIgnoringOtherApps_.assert_called_once_with(True)
+        app.activate.assert_not_called()
+
+    def test_synchronous_activation_callback_cannot_recurse(self):
+        cocoa, app = self.cocoa()
+        window = Mock()
+        window._nswindow.makeKeyAndOrderFront_.side_effect = lambda sender: activate_window(window)
+        with patch('window_support.sys.platform', 'darwin'), \
+                patch.dict('sys.modules', {'pyglet.libs.darwin': Mock(cocoapy=cocoa)}):
+            activate_window(window)
+        window._nswindow.makeKeyAndOrderFront_.assert_called_once()
+
+    def test_other_platforms_use_pyglet_activation(self):
+        window = Mock()
+        with patch('window_support.sys.platform', 'win32'):
+            activate_window(window)
+        window.activate.assert_called_once()
+
     def test_configuration_preserves_logical_coordinates_without_shadow_window(self):
         pyglet = Mock()
         with patch.dict('sys.modules', {'pyglet': pyglet}):
             configure_windowing()
         self.assertFalse(pyglet.options.shadow_window)
         self.assertEqual(pyglet.options.dpi_scaling, 'stretch')
+
+    def test_all_apple_silicon_macs_use_the_native_cocoa_event_loop(self):
+        pyglet = Mock()
+        with patch('window_support.sys.platform', 'darwin'), \
+                patch('window_support.platform.machine', return_value='arm64'), \
+                patch.dict('sys.modules', {'pyglet': pyglet}):
+            configure_windowing()
+        self.assertTrue(pyglet.options.osx_alt_loop)
 
     def test_window_uses_native_pyglet_controls_and_starts_hidden(self):
         pyglet = Mock()

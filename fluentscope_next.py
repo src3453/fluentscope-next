@@ -5,7 +5,7 @@ import sys
 import threading
 
 from window_support import (
-    configure_windowing, create_window, desktop_size, render_size, mouse_position,
+    configure_windowing, create_window, desktop_size, render_size, mouse_position, activate_window,
 )
 
 configure_windowing()
@@ -2656,6 +2656,18 @@ def on_key_press(symbol, modifiers):
 
 
 @window.event
+def on_activate():
+    if sys.platform == 'darwin':
+        activate_window(window)
+
+
+@window.event
+def on_show():
+    if sys.platform == 'darwin':
+        activate_window(window)
+
+
+@window.event
 def on_mouse_motion(x, y, dx, dy):
     global pointer_position
     pointer_position = mouse_position(x, y, HEIGHT)
@@ -2669,6 +2681,8 @@ def on_mouse_drag(x, y, dx, dy, buttons, modifiers):
 @window.event
 def on_mouse_press(x, y, button, modifiers):
     global menu_open
+    if sys.platform == 'darwin':
+        activate_window(window)
     on_mouse_motion(x, y, 0, 0)
     if button != mouse.LEFT:
         return
@@ -2802,7 +2816,7 @@ def draw_frame(dt):
 
 
 window.set_visible(True)
-window.activate()
+activate_window(window)
 schedule_frames()
 try:
     pyglet.app.run(interval=None)
