@@ -93,6 +93,50 @@ class PygletAppTests(unittest.TestCase):
                         frame()
                         test.assertIs(window.context, context)
 
+            # Mode changes update both plots, clear history, and persist on resize.
+            state['view'] = state['VIEW_SPECTRUM']
+            for mode in ('Linear', 'Mel', 'Cepstrum', 'Log'):
+                old_waterfall = state['waterfall']
+                state['on_key_press'](key.Q, 0)
+                test.assertEqual(state['spectrum_mode'], mode)
+                test.assertEqual(state['analyzer'].mode, mode)
+                test.assertIs(state['waterfall'], old_waterfall)
+                test.assertFalse(state['waterfall'].history.any())
+                frame()
+            state['on_key_press'](key.Q, key.MOD_SHIFT)
+            test.assertEqual(state['spectrum_mode'], 'Cepstrum')
+            state['apply_settings']({'spectrum_mode': 'invalid'})
+            test.assertEqual(state['spectrum_mode'], 'Cepstrum')
+
+            # Independent frequency range and cepstrum zoom, with persistent smoothing.
+            state['on_key_press'](key.Y, 0)
+            test.assertEqual(state['cepstrum_zoom'], 2)
+            test.assertEqual(state['analyzer'].db_max, 0.5)
+            state['on_key_press'](key.U, 0)
+            test.assertEqual(state['analyzer'].smoothing, 'Low')
+            frame()
+            state['on_key_press'](key.U, key.MOD_SHIFT)
+            test.assertEqual(state['analyzer'].smoothing, 'Off')
+            state['on_key_press'](key.U, key.MOD_SHIFT)
+            test.assertEqual(state['analyzer'].smoothing, 'High')
+            state['on_key_press'](key.Q, 0)
+            test.assertEqual(state['analyzer'].db_min, -100)
+            state['on_key_press'](key.Y, 0)
+            test.assertEqual(state['analyzer'].db_min, -120)
+            state['on_key_press'](key.Y, key.MOD_SHIFT)
+            test.assertEqual(state['analyzer'].db_min, -100)
+            state['on_key_press'](key.Y, 0)
+            state['on_key_press'](key.Q, key.MOD_SHIFT)
+            test.assertEqual(state['analyzer'].db_max, 0.5)
+            state['apply_settings']({'spectrum_smoothing': [], 'spectrum_db_range': True,
+                                     'cepstrum_zoom': True})
+            test.assertEqual(state['analyzer'].smoothing, 'High')
+            test.assertEqual(state['spectrum_db_range'], 120)
+            test.assertEqual(state['cepstrum_zoom'], 2)
+            for renderer in ('CRT', 'GL Line', 'Pyglet') if modern else ('Pyglet',):
+                state['trace_renderer'] = renderer
+                frame()
+
             # Silence must render safely, including a stationary XY figure.
             with state['lock']:
                 state['ring'].fill(0)
@@ -112,6 +156,9 @@ class PygletAppTests(unittest.TestCase):
             window.dispatch_events()
             frame()
             test.assertEqual((state['WIDTH'], state['HEIGHT']), (800, 520))
+            test.assertEqual(state['analyzer'].mode, 'Cepstrum')
+            test.assertEqual(state['analyzer'].smoothing, 'High')
+            test.assertEqual(state['analyzer'].db_max, 0.5)
             state['show_hud'], state['menu_open'] = True, False
             x, y = state['MENU_BUTTON'].center
             state['on_mouse_press'](x, state['HEIGHT'] - y, state['mouse'].LEFT, 0)
@@ -128,8 +175,18 @@ class PygletAppTests(unittest.TestCase):
             test.assertEqual(window.get_size(), state['DEFAULT_WINDOW_SIZE'])
             with open(state['SETTINGS_PATH']) as settings:
                 saved = json.load(settings)
+            test.assertEqual(saved['spectrum_mode'], 'Cepstrum')
+            test.assertEqual(saved['spectrum_smoothing'], 'High')
+            test.assertEqual(saved['spectrum_db_range'], 120)
+            test.assertEqual(saved['cepstrum_zoom'], 2)
             test.assertEqual(saved['trace_renderer'], state['trace_renderer'])
             test.assertEqual(saved['window_size'], list(state['DEFAULT_WINDOW_SIZE']))
+            state['set_spectrum_options'](mode='Linear', smoothing='Off', db_range=40, zoom=1)
+            state['apply_settings'](saved)
+            test.assertEqual(state['analyzer'].mode, 'Cepstrum')
+            test.assertEqual(state['analyzer'].smoothing, 'High')
+            test.assertEqual(state['analyzer'].db_max, 0.5)
+            test.assertEqual(state['spectrum_db_range'], 120)
             # Check focus after Cocoa's real event loop has finished launching.
             # A topmost window alone does not prove it can receive keyboard input.
             focus_errors = []

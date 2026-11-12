@@ -4,6 +4,11 @@ import os
 import sys
 import threading
 
+from spectrum_analysis import (
+    SpectrumAnalyzer, SPECTRUM_MODES, SPECTRUM_SMOOTHING,
+    SPECTRUM_DB_RANGES, CEPSTRUM_ZOOMS,
+)
+
 from window_support import (
     configure_windowing, create_window, desktop_size, render_size, mouse_position, activate_window,
 )
@@ -42,7 +47,6 @@ FFT_SIZE = 2 ** 11 # larger = finer frequency resolution, slower response
 SPEC_F_MIN = 20.0
 SPEC_F_MAX = RATE / 2
 
-SPEC_DB_MIN = -100.0
 SPEC_DB_MAX = 0.0
 
 SPEC_FALL_DB_PER_SEC = 240.0 # how fast the spectrum line falls back after a peak
@@ -1147,70 +1151,6 @@ def draw_level_meter(surface, meter, theme, small_font, left, top, width, height
 # ==========================
 
 
-class SpectrumAnalyzer:
-    """FFT magnitude (dBFS) mapped onto `width` log-spaced frequency columns."""
-
-    def __init__(self, fft_size, rate, width, f_min, f_max, db_min, db_max):
-        self.fft_size = fft_size
-        self.rate = rate
-        self.width = width
-        self.f_min = f_min
-        self.f_max = f_max
-        self.db_min = db_min
-        self.db_max = db_max
-
-        self.window = np.hanning(fft_size).astype(np.float32)
-        # a full-scale sine reads 0 dBFS
-        self.scale = 2.0 / self.window.sum()
-
-        bin_count = fft_size // 2 + 1
-        self.bin_positions = np.arange(bin_count, dtype=np.float32)
-
-        # column edges in Hz (log spaced) -> fractional FFT bin positions
-        edges_hz = f_min * (f_max / f_min) ** (np.arange(width + 1) / width)
-        edges_bin = edges_hz * fft_size / rate
-        centers_bin = np.sqrt(edges_bin[:-1] * edges_bin[1:])
-
-        edge_idx = np.clip(np.ceil(edges_bin).astype(np.int64), 0, bin_count - 1)
-        self.reduce_idx = edge_idx[:-1]
-        # columns that contain at least one bin take the max; sparse (low freq)
-        # columns are interpolated instead
-        self.dense = edge_idx[1:] > edge_idx[:-1]
-        self.centers_bin = centers_bin.astype(np.float32)
-
-        self.columns = np.full(width, db_min, dtype=np.float32)
-        self.smoothed = np.full(width, db_min, dtype=np.float32)
-
-    def freq_to_x(self, freq):
-        return self.width * math.log(freq / self.f_min) / math.log(self.f_max / self.f_min)
-
-    def update(self, samples, dt):
-        spectrum = np.abs(np.fft.rfft(samples * self.window)) * self.scale
-        db = 20.0 * np.log10(spectrum + 1e-12)
-
-        peak = np.maximum.reduceat(db, self.reduce_idx)
-        interp = np.interp(self.centers_bin, self.bin_positions, db)
-        columns = np.where(self.dense, peak, interp)
-        self.columns = np.clip(columns, self.db_min, self.db_max).astype(np.float32)
-
-        # instant attack, linear release
-        self.smoothed = np.maximum(
-            self.columns,
-            self.smoothed - SPEC_FALL_DB_PER_SEC * dt,
-        )
-
-    def normalized(self, values):
-        return (values - self.db_min) / (self.db_max - self.db_min)
-
-    def line_points(self, top, height, round_pixels=True):
-        x = np.arange(self.width, dtype=np.float32)
-        y = top + (1.0 - self.normalized(self.smoothed)) * (height - 1)
-        points = np.column_stack((x, y))
-        if not round_pixels:
-            return points.astype(np.float32)
-        return np.rint(points).astype(np.int32)
-
-
 SPEC_FREQ_TICKS = [
     (50, "50"), (100, "100"), (200, "200"), (500, "500"),
     (1000, "1k"), (2000, "2k"), (5000, "5k"), (10000, "10k"), (20000, "20k"),
@@ -1218,12 +1158,21 @@ SPEC_FREQ_TICKS = [
 
 
 def _visible_freq_ticks(analyzer):
+    if analyzer.mode == "Cepstrum":
+        for ms in (1, 2, 5, 10, 20, 50, 100):
+            if analyzer.q_min < ms / 1000 < analyzer.q_max:
+                yield int(analyzer.quefrency_to_x(ms / 1000)), f"{ms}ms"
+        return
     for freq, label in SPEC_FREQ_TICKS:
         if analyzer.f_min < freq < analyzer.f_max:
             yield int(analyzer.freq_to_x(freq)), label
 
 
 def _db_ticks(analyzer, top, height):
+    if analyzer.mode == "Cepstrum":
+        for value in np.linspace(analyzer.db_min, analyzer.db_max, 5):
+            yield int(top + (1.0 - analyzer.normalized(value)) * (height - 1)), value
+        return
     db = math.ceil(analyzer.db_min / 20) * 20
     while db <= analyzer.db_max:
         yield int(top + (1.0 - analyzer.normalized(db)) * (height - 1)), db
@@ -1248,7 +1197,8 @@ def draw_spectrum_labels(surface, analyzer, theme, small_font, top, height, show
 
     if show_db:
         for y, db in _db_ticks(analyzer, top, height):
-            text = small_font.render(f"{db:.0f}dB", True, theme["text"])
+            label = f"{db:g}" if analyzer.mode == "Cepstrum" else f"{db:.0f}dB"
+            text = small_font.render(label, True, theme["text"])
             surface.blit(text, (analyzer.width - text.get_width() - 4, y + 2))
 
 
@@ -1302,7 +1252,7 @@ class Waterfall:
         """A copy at another size: columns resampled, newest rows kept."""
         new = Waterfall(width, height)
         order = (self.head - np.arange(self.height)) % self.height
-        # columns are log-frequency positions, so a nearest-column resample keeps them aligned
+        # Resample columns on the current analysis axis.
         columns = np.minimum((np.arange(width) * self.width) // width, self.width - 1)
         rows = min(height, self.height)
         new.history[(-np.arange(rows)) % height] = self.history[order[:rows]][:, columns]
@@ -1523,6 +1473,10 @@ VIEW_NAMES = ["Scope", "Spectrum", "Lissajous"]
 
 view = VIEW_SCOPE
 show_overlay = True
+spectrum_mode = "Log"
+spectrum_smoothing = "Off"
+spectrum_db_range = 100
+cepstrum_zoom = 1
 show_scope_graticule = True
 show_scope_dbfs_scale = True
 scope_samples = DEFAULT_SCOPE_SAMPLES
@@ -1610,17 +1564,53 @@ def update_layout():
     if not changed:
         return
     if analyzer is None or analyzer.width != PLOT_WIDTH:
-        analyzer = SpectrumAnalyzer(
-            FFT_SIZE, RATE, PLOT_WIDTH,
-            SPEC_F_MIN, SPEC_F_MAX,
-            SPEC_DB_MIN, SPEC_DB_MAX,
-        )
+        analyzer = create_spectrum_analyzer()
     old_waterfall = waterfall
     waterfall = Waterfall(*waterfall_size) if waterfall is None else waterfall.resized(*waterfall_size)
     if old_waterfall is not None:
         old_waterfall.image.delete()
     waterfall.rerender(theme["lut"])
     crt_scene = None # the phosphor was drawn for the old layout
+
+
+def create_spectrum_analyzer():
+    return SpectrumAnalyzer(
+        FFT_SIZE, RATE, PLOT_WIDTH, SPEC_F_MIN, SPEC_F_MAX,
+        -spectrum_db_range, SPEC_DB_MAX, spectrum_mode, SPEC_FALL_DB_PER_SEC,
+        smoothing=spectrum_smoothing, cepstrum_zoom=cepstrum_zoom,
+    )
+
+
+def set_spectrum_options(mode=None, smoothing=None, db_range=None, zoom=None):
+    """Apply valid options and reset history whose axis or averaging has changed."""
+    global spectrum_mode, spectrum_smoothing, spectrum_db_range, cepstrum_zoom
+    global analyzer, crt_scene
+    previous = (spectrum_mode, spectrum_smoothing, spectrum_db_range, cepstrum_zoom)
+    if mode in SPECTRUM_MODES:
+        spectrum_mode = mode
+    if isinstance(smoothing, str) and smoothing in SPECTRUM_SMOOTHING:
+        spectrum_smoothing = smoothing
+    if type(db_range) in (int, float) and db_range in SPECTRUM_DB_RANGES:
+        spectrum_db_range = db_range
+    if type(zoom) in (int, float) and zoom in CEPSTRUM_ZOOMS:
+        cepstrum_zoom = zoom
+    if previous == (spectrum_mode, spectrum_smoothing, spectrum_db_range, cepstrum_zoom):
+        return
+    analyzer = create_spectrum_analyzer()
+    # Keep the image/texture: retained sprites may still refer to it this frame.
+    waterfall.history.fill(0)
+    waterfall.head = 0
+    waterfall.pending_rows = 0.0
+    waterfall.rerender(theme["lut"])
+    crt_scene = None
+
+
+def set_spectrum_mode(mode):
+    set_spectrum_options(mode=mode)
+
+
+def spectrum_range_label():
+    return f"Zoom: {cepstrum_zoom:g}x" if spectrum_mode == "Cepstrum" else f"Range: {spectrum_db_range:g}dB"
 
 
 def apply_window_size(width, height):
@@ -1675,6 +1665,10 @@ def apply_settings(data):
 
     if data.get("view") in VIEW_NAMES:
         view = VIEW_NAMES.index(data["view"])
+    set_spectrum_options(
+        mode=data.get("spectrum_mode"), smoothing=data.get("spectrum_smoothing"),
+        db_range=data.get("spectrum_db_range"), zoom=data.get("cepstrum_zoom"),
+    )
     if isinstance(data.get("show_overlay"), bool):
         show_overlay = data["show_overlay"]
     if isinstance(data.get("line_is_step"), bool):
@@ -1752,6 +1746,10 @@ def current_settings():
     data.update({
         "view": VIEW_NAMES[view],
         "show_overlay": show_overlay,
+        "spectrum_mode": spectrum_mode,
+        "spectrum_smoothing": spectrum_smoothing,
+        "spectrum_db_range": spectrum_db_range,
+        "cepstrum_zoom": cepstrum_zoom,
         "show_level_meter": show_level_meter,
         "show_hud": show_hud,
         "show_scope_graticule": show_scope_graticule,
@@ -2262,6 +2260,11 @@ def menu_items():
             *([(key.F7, "F7", f"Retina resolution: {'On' if RETINA else 'Off'}")]
               if sys.platform == 'darwin' and gl_renderer is not None else []),
         )),
+        ("Spectrum", (
+            (key.Q, "Q", f"Mode: {spectrum_mode}"),
+            (key.U, "U", f"Smoothing: {spectrum_smoothing}"),
+            (key.Y, "Y", spectrum_range_label()),
+        )),
         ("Scope", (
             (key.X, "X", f"Time span: {scope_time_span()}"),
             (key.P, "P", f"Line: {'Step' if line_is_step else 'Smooth'}"),
@@ -2415,7 +2418,7 @@ def hud_texts(detected_period):
             agc_status += f" x{lissajous_gain / LISSAJOUS_GAIN:.2f}"
         help_text += f"   AGC:{agc_status}"
     else:
-        help_text = f"View:{VIEW_NAMES[view]}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
+        help_text = f"View:{VIEW_NAMES[view]}   Spectrum:{spectrum_mode}   Smooth:{spectrum_smoothing}   {spectrum_range_label()}   Overlay:{'ON' if show_overlay else 'OFF'}   Theme:{theme['name']}   Trigger:{trigger_info}   Stereo:{stereo_info}"
         if view == VIEW_SCOPE:
             help_text += f"   Time span: {scope_time_span()}"
     texts.append((small_font, help_text))
@@ -2514,7 +2517,8 @@ print(r"""     ______              __  ____
                                       /_/  [Next]
   ~ Completely Rewritten ~
   (c) 2026 src3453 Released under The MIT License.""")
-print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
+print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [Q]/[Shift+Q] spectrum mode  [T]/[Shift+T] theme  [R] trigger mode  [M] stereo mode")
+print("        [U]/[Shift+U] spectrum smoothing  [Y]/[Shift+Y] spectrum dB range / cepstrum zoom")
 print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button  [F4] Reset window size")
 print("        [F5] Max FPS (+Shift: back)  [F6] VSync")
 if sys.platform == 'darwin' and gl_renderer is not None:
@@ -2589,6 +2593,21 @@ def handle_key(symbol, modifiers):
         step = -1 if modifiers & key.MOD_SHIFT else 1
         index = LISSAJOUS_INVERTS.index(lissajous_invert) + step
         lissajous_invert = LISSAJOUS_INVERTS[index % len(LISSAJOUS_INVERTS)]
+    elif symbol == key.Q:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        set_spectrum_mode(SPECTRUM_MODES[(SPECTRUM_MODES.index(spectrum_mode) + step) % len(SPECTRUM_MODES)])
+    elif symbol == key.U:
+        options = tuple(SPECTRUM_SMOOTHING)
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        set_spectrum_options(smoothing=options[(options.index(spectrum_smoothing) + step) % len(options)])
+    elif symbol == key.Y:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        if spectrum_mode == "Cepstrum":
+            index = (CEPSTRUM_ZOOMS.index(cepstrum_zoom) + step) % len(CEPSTRUM_ZOOMS)
+            set_spectrum_options(zoom=CEPSTRUM_ZOOMS[index])
+        else:
+            index = (SPECTRUM_DB_RANGES.index(spectrum_db_range) + step) % len(SPECTRUM_DB_RANGES)
+            set_spectrum_options(db_range=SPECTRUM_DB_RANGES[index])
     elif symbol == key.S:
         show_overlay = not show_overlay
     elif symbol == key.T:

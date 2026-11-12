@@ -101,6 +101,9 @@ FLUENTSCOPE_NATIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
 | F7 | Toggle Retina plot resolution (macOS, with ModernGL) |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
+| Q / Shift+Q | Cycle spectrum mode forward or backward: Log, Linear, Mel, Cepstrum |
+| U / Shift+U | Cycle spectrum time smoothing: Off, Low, Med, High |
+| Y / Shift+Y | Cycle spectrum dB range, or vertical zoom in Cepstrum |
 | R / M | Cycle the trigger or stereo mode |
 | X / Shift+X | Cycle the Scope time span forward or backward |
 | P | Toggle step or smooth Scope lines (Pyglet and GL Line renderers) |
@@ -115,6 +118,10 @@ FLUENTSCOPE_NATIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
 The **Time span** control in the F1 menu selects how much audio the Scope shows across its horizontal axis. At 48 kHz the options are 5.33, 10.67, 21.33 (default), 42.67, and 85.33 ms.
 
 On macOS, **Display → Retina resolution** in the F1 menu (or F7) switches the plot's offscreen render targets between logical and native display resolution immediately, without recreating the window or OpenGL context. It defaults to Off and is saved as `retina` in `fluentscope_settings.json`. Window size and mouse coordinates stay in logical points, and line widths retain their apparent size. The HUD and controls menu always render at native resolution, including their font glyphs. Moving between displays updates the rendering resolution automatically. Retina uses more GPU memory and processing on high-density displays; on a standard-density display both settings render at the same resolution. Without ModernGL, pyglet draws everything at native resolution and this option is hidden.
+
+The **Mode** control in the F1 menu’s **Spectrum** group (or Q / Shift+Q) selects the analysis used by both the spectrum overlay and the Spectrum view, including its waterfall. Log (default), Linear, and Mel use the corresponding frequency axis with dBFS levels. Mel uses the standard 2595 log10(1 + f/700) mapping. Cepstrum shows the absolute real cepstrum of the log magnitude spectrum: the horizontal axis is quefrency in milliseconds, excluding zero, and the vertical axis is coefficient magnitude (0–1 at 1x zoom). Switching modes clears waterfall history to keep its axis consistent. The selected mode is saved and survives window resizing.
+
+In the **Spectrum** menu, **Smoothing** (U / Shift+U) selects exponential time averaging: Off (default), Low (50 ms), Med (150 ms), or High (400 ms). It smooths both the plotted line and new waterfall rows, with timing independent of the frame rate. Off retains the original instant attack and falling peak line. **Range** (Y / Shift+Y) selects a 40, 60, 80, 100 (default), 120, or 140 dB span below 0 dBFS. In Cepstrum this control becomes **Zoom**, with vertical magnification of 1x (default), 2x, 4x, 8x, or 16x; the quefrency axis stays fixed. Range and zoom are remembered independently. These controls also affect the Scope overlay, are saved across restarts, and clear the waterfall when changed.
 
 Settings are saved to `fluentscope_settings.json` beside the script.
 
