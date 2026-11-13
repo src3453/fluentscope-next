@@ -17,14 +17,8 @@ configure_windowing()
 
 import numpy as np
 import pyglet
-try:
-    if sys.platform != "win32":
-        raise ImportError
-    import pyaudiowpatch as pyaudio
-except ImportError:
-    import pyaudio
-
-from audio_devices import capture_devices, resolve_device, print_devices, open_capture, choose_device
+from audio_devices import (AudioSystem, BUFFER_SIZES, WASAPI_API, capture_devices,
+                           resolve_device, print_devices, open_capture, choose_device)
 
 # ==========================
 # Audio Settings
@@ -32,8 +26,10 @@ from audio_devices import capture_devices, resolve_device, print_devices, open_c
 
 RATE = 48000
 CHANNELS = 2 # 2 = stereo; falls back to mono if the device has only one input channel
-FORMAT = pyaudio.paInt16
-CHUNK = 512
+AUDIO_BUFFER = 0 # [F8] frames per audio callback (BUFFER_SIZES); 0 = Auto (lowest the driver allows), BUFFER_FPS_SYNC = follow the frame rate
+BUFFER_FPS_SYNC = -1 # largest power-of-two buffer that fits in one display frame
+AUDIO_BUFFER_OPTIONS = (0, BUFFER_FPS_SYNC) + BUFFER_SIZES[1:]
+WASAPI_EXCLUSIVE = False # [F9] open WASAPI inputs in exclusive mode (lower latency, device not shared)
 
 SCOPE_SAMPLE_COUNTS = (256, 512, 1024, 2048, 4096)
 DEFAULT_SCOPE_SAMPLES = 1024
@@ -1308,21 +1304,92 @@ def callback(in_data, frame_count, time_info, status):
         write_pos = (write_pos + n) % RING_SIZE
         samples_written += n
 
-    return (None, pyaudio.paContinue)
+    return (None, 0) # PyAudio's paContinue (loopback); sounddevice ignores the result
+
+
+# ==========================
+# Persistent Settings
+# ==========================
+
+SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fluentscope_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"Warning: failed to load settings ({exc})")
+        return {}
+
+
+saved_settings = load_settings()
+if saved_settings.get("audio_buffer") in AUDIO_BUFFER_OPTIONS and type(saved_settings["audio_buffer"]) is int:
+    AUDIO_BUFFER = saved_settings["audio_buffer"]
+if isinstance(saved_settings.get("wasapi_exclusive"), bool):
+    WASAPI_EXCLUSIVE = saved_settings["wasapi_exclusive"]
 
 
 # ==========================
 # Audio Start
 # ==========================
 
-pa = pyaudio.PyAudio()
+audio = AudioSystem()
 
-def prepare_capture(device):
-    return open_capture(pa, pyaudio, device, callback, CHUNK, RATE, CHANNELS)
+
+def terminate_audio():
+    audio.terminate()
+
+
+def monitor_refresh_rate():
+    """Refresh rate of the window's monitor (default monitor before it opens); 60 if unknown."""
+    try:
+        screen = (globals()["window"].screen if "window" in globals()
+                  else pyglet.display.get_display().get_default_screen())
+        rate = getattr(screen.get_mode(), "rate", 0)
+        return float(rate) if rate and rate > 1 else 60.0
+    except Exception:
+        return 60.0
+
+
+def display_frame_rate():
+    """Frames actually shown per second: the cap, or the monitor under VSync / unlimited."""
+    return monitor_refresh_rate() if VSYNC or FPS == 0 else float(FPS)
+
+
+def fps_synced_buffer(rate=RATE):
+    """Largest power-of-two buffer no longer than one frame, so every frame gets new audio."""
+    frames = rate / display_frame_rate()
+    sizes = [size for size in BUFFER_SIZES[1:] if size <= frames]
+    return sizes[-1] if sizes else BUFFER_SIZES[1]
+
+
+def effective_audio_buffer(rate=RATE):
+    return fps_synced_buffer(rate) if AUDIO_BUFFER == BUFFER_FPS_SYNC else AUDIO_BUFFER
+
+
+def uses_wasapi_exclusive(device):
+    return (WASAPI_EXCLUSIVE and device.get('api_name') == WASAPI_API
+            and not device.get('isLoopbackDevice'))
+
+
+def prepare_capture(device, rate=RATE):
+    buffer_frames = effective_audio_buffer(rate)
+    try:
+        return open_capture(audio, device, callback, buffer_frames, rate, CHANNELS,
+                            exclusive=WASAPI_EXCLUSIVE)
+    except (OSError, ValueError) as exc:
+        if not uses_wasapi_exclusive(device):
+            raise
+        print(f"WASAPI exclusive mode failed ({exc}); using shared mode.")
+        return open_capture(audio, device, callback, buffer_frames, rate, CHANNELS)
 
 
 try:
-    devices = capture_devices(pa)
+    devices = capture_devices(audio)
     if len(sys.argv) > 2:
         raise ValueError('Pass one device index/name, --loopback, or --list-devices.')
     if len(sys.argv) > 1:
@@ -1330,33 +1397,85 @@ try:
             print('Usage: fluentscope_next.py [DEVICE | --loopback | --list-devices]')
             print('Without arguments, opens the audio source picker.')
             print_devices(devices)
-            pa.terminate()
+            terminate_audio()
             sys.exit(0)
-        device_info = resolve_device(pa, devices, sys.argv[1])
+        device_info = resolve_device(audio, devices, sys.argv[1])
         stream, STREAM_OPEN_KWARGS = prepare_capture(device_info)
     else:
-        selection = choose_device(pa, devices, prepare_capture)
+        selection = choose_device(audio, devices, prepare_capture)
         if selection is None:
-            pa.terminate()
+            terminate_audio()
             sys.exit(0)
         device_info, (stream, STREAM_OPEN_KWARGS) = selection
 except Exception as exc:
     print(f'Unable to start audio capture: {exc}')
     print_devices(locals().get('devices', []))
-    pa.terminate()
+    terminate_audio()
     sys.exit(1)
 
 INPUT_DEVICE_INDEX = int(device_info['index'])
+
+
+def format_buffer(setting=None):
+    """Buffer setting as shown to the user; FPS sync also shows the size in use."""
+    setting = AUDIO_BUFFER if setting is None else setting
+    if setting == 0:
+        return "Auto"
+    if setting == BUFFER_FPS_SYNC:
+        return f"FPS sync {STREAM_OPEN_KWARGS.get('buffer_frames') or effective_audio_buffer()}"
+    return str(setting)
+
+
+def audio_latency_label():
+    latency = STREAM_OPEN_KWARGS.get("latency")
+    return f" ({latency * 1000:.1f}ms)" if isinstance(latency, (int, float)) else ""
+
+
+def audio_buffer_status():
+    """Buffer size, the latency PortAudio reports for the open stream, and the mode."""
+    latency = STREAM_OPEN_KWARGS.get("latency")
+    parts = [f"buffer {format_buffer()}"]
+    if isinstance(latency, (int, float)):
+        parts.append(f"latency {latency * 1000:.1f} ms")
+    if STREAM_OPEN_KWARGS.get("exclusive"):
+        parts.append("WASAPI exclusive")
+    return ", ".join(parts)
+
 input_channels = STREAM_OPEN_KWARGS['channels']
 RATE = STREAM_OPEN_KWARGS['rate']
 SPEC_F_MAX = RATE / 2
-print(f"Audio source: {device_info['name']} ({input_channels} channels, {RATE} Hz)")
+print(f"Audio source: {device_info['name']} [{device_info.get('api_name', '?')}] "
+      f"({input_channels} channels, {RATE} Hz, {audio_buffer_status()})")
 
 
 def open_audio_stream():
-    audio_stream, _ = prepare_capture(device_info)
+    audio_stream, opened = prepare_capture(device_info, RATE)
+    if (opened['rate'], opened['channels']) != (RATE, input_channels):
+        audio_stream.close()
+        raise OSError(f"the device would switch to {opened['channels']} channels at "
+                      f"{opened['rate']} Hz; restart to change the format")
     audio_stream.start_stream()
+    STREAM_OPEN_KWARGS.update(opened)
     return audio_stream
+
+
+def set_audio_options(buffer_frames, exclusive):
+    """Reopen the stream with new buffer / exclusive settings; revert if it fails."""
+    global AUDIO_BUFFER, WASAPI_EXCLUSIVE
+    previous = AUDIO_BUFFER, WASAPI_EXCLUSIVE
+    AUDIO_BUFFER, WASAPI_EXCLUSIVE = buffer_frames, exclusive
+    if recover_audio_stream():
+        print(f"Audio: {audio_buffer_status()}")
+    else:
+        AUDIO_BUFFER, WASAPI_EXCLUSIVE = previous
+        recover_audio_stream()
+
+
+def sync_audio_buffer():
+    """In FPS sync mode, reopen the stream when the frame rate calls for another size."""
+    if (AUDIO_BUFFER == BUFFER_FPS_SYNC
+            and STREAM_OPEN_KWARGS.get("buffer_frames") != effective_audio_buffer()):
+        set_audio_options(AUDIO_BUFFER, WASAPI_EXCLUSIVE)
 
 
 def recover_audio_stream():
@@ -1385,26 +1504,6 @@ def recover_audio_stream():
 
 stream.start_stream()
 
-# ==========================
-# Persistent Settings
-# ==========================
-
-SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fluentscope_settings.json")
-
-
-def load_settings():
-    try:
-        with open(SETTINGS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as exc:
-        print(f"Warning: failed to load settings ({exc})")
-        return {}
-
-
-saved_settings = load_settings()
 # needed before the window opens (the swap interval is set at creation)
 if isinstance(saved_settings.get("vsync"), bool):
     VSYNC = saved_settings["vsync"]
@@ -1442,7 +1541,7 @@ try:
     window = create_window(WIDTH, HEIGHT, vsync=VSYNC, minimum_size=(MIN_WIDTH, MIN_HEIGHT))
 except Exception:
     stream.close()
-    pa.terminate()
+    terminate_audio()
     raise
 
 font, small_font = ui.Font(18), ui.Font(13)
@@ -1535,6 +1634,7 @@ hud_bottom = 0 # lowest pixel row of the status text (0 while it is hidden)
 MENU_COLUMN_WIDTH = 209
 MENU_COLUMN_GAP = 8
 MENU_ROW_HEIGHT = 21
+MENU_SPACINGS = ((MENU_ROW_HEIGHT, 32, 7), (18, 27, 4), (15, 23, 1)) # (row, group title, title y offset), roomiest first
 MENU_PADDING = 10
 MENU_HINT = "Shift reverses supported controls or changes XY delay by x2 / x0.5."
 
@@ -1770,6 +1870,8 @@ def current_settings():
         "max_fps": FPS,
         "vsync": VSYNC,
         "retina": RETINA,
+        "audio_buffer": AUDIO_BUFFER,
+        "wasapi_exclusive": WASAPI_EXCLUSIVE,
     })
     if gl_renderer is not None:
         data.pop("crt_enabled", None) # superseded by trace_renderer
@@ -2242,6 +2344,10 @@ def scope_time_span():
     return f"{scope_samples * 1000 / RATE:.2f} ms"
 
 
+def device_supports_exclusive():
+    return device_info.get("api_name") == WASAPI_API and not device_info.get("isLoopbackDevice")
+
+
 def menu_items():
     agc = scope_agc_mode
     hold = format_seconds(SCOPE_AGC_HOLD_TIME) if scope_agc_peak_hold else "Off"
@@ -2255,10 +2361,17 @@ def menu_items():
             (key.F2, "F2", f"Level meter: {'On' if show_level_meter else 'Off'}"),
             (key.F3, "F3", f"Status & button: {'On' if show_hud else 'Off'}"),
             (key.F4, "F4", "Reset size ({}x{})".format(*DEFAULT_WINDOW_SIZE)),
+        )),
+        ("System", (
             (key.F5, "F5", f"Max FPS: {format_fps(FPS)}{' (VSync)' if VSYNC else ''}"),
             (key.F6, "F6", f"VSync: {'On' if VSYNC else 'Off'}"),
-            *([(key.F7, "F7", f"Retina resolution: {'On' if RETINA else 'Off'}")]
+            *([(key.F7, "F7", f"Retina: {'On' if RETINA else 'Off'}")]
               if sys.platform == 'darwin' and gl_renderer is not None else []),
+            (key.F8, "F8", f"Buffer: {format_buffer()}{audio_latency_label()}"),
+            *([(key.F9, "F9", "Exclusive: " + (
+                "Off" if not WASAPI_EXCLUSIVE else
+                "On" if STREAM_OPEN_KWARGS.get("exclusive") else "On (shared)"))]
+              if device_supports_exclusive() else []),
         )),
         ("Spectrum", (
             (key.Q, "Q", f"Mode: {spectrum_mode}"),
@@ -2316,40 +2429,63 @@ def wrap_words(text, text_font, max_width, separator=" "):
     return lines
 
 
+def fit_text(text, text_font, max_width):
+    """Shorten text with '..' to fit max_width (only in windows too narrow for a column)."""
+    if text_font.size(text)[0] <= max_width:
+        return text
+    while len(text) > 1 and text_font.size(text + "..")[0] > max_width:
+        text = text[:-1]
+    return text.rstrip() + ".."
+
+
 def menu_layout():
     """
-    Place the menu groups for the current window: as many columns as fit, the
-    rest wrapped into further bands below. Returns (panel rect, titles, rows,
-    hint lines) with titles = [(text, (x, y))] and rows = [(key, label, rect)].
+    Place the menu groups for the current window: as many columns as fit, each
+    group under the currently shortest column. Short windows get tighter rows,
+    then lose the hint. Returns (panel rect, titles, rows, hint lines) with
+    titles = [(text, (x, y))] and rows = [(key, label, rect)].
     """
-    groups = menu_items()
+    groups = [(title, [(key, f"[{shortcut}] {text}") for key, shortcut, text in items])
+              for title, items in menu_items()]
     available = WIDTH - 2 * MENU_PADDING # the panel may cover the level meter
-    step = MENU_COLUMN_WIDTH + MENU_COLUMN_GAP
+    # columns as wide as the longest label, so no label runs into the next column
+    widest = max(small_font.size(label)[0] for _, items in groups for _, label in items) + 8
+    column_width = max(1, min(max(MENU_COLUMN_WIDTH, widest), available - 2 * MENU_PADDING))
+    step = column_width + MENU_COLUMN_GAP
     columns = max(1, min(len(groups), (available - 2 * MENU_PADDING + MENU_COLUMN_GAP) // step))
-    column_width = min(MENU_COLUMN_WIDTH, available - 2 * MENU_PADDING)
-    width = 2 * MENU_PADDING + columns * (column_width + MENU_COLUMN_GAP) - MENU_COLUMN_GAP
-    hint = wrap_words(MENU_HINT, small_font, width - 2 * MENU_PADDING)
+    width = 2 * MENU_PADDING + columns * step - MENU_COLUMN_GAP
+    full_hint = wrap_words(MENU_HINT, small_font, width - 2 * MENU_PADDING)
 
     # right-aligned to the plot like the button, shifted left only as far as needed
     left = min(max(MENU_PADDING, PLOT_WIDTH - MENU_PADDING - width), WIDTH - MENU_PADDING - width)
     top = 36 if show_hud else 6
+    room = HEIGHT - top - 4
 
-    titles, rows = [], []
-    y = top
-    for band in range(0, len(groups), columns):
-        band_groups = groups[band:band + columns]
-        for column, (title, items) in enumerate(band_groups):
-            x = left + MENU_PADDING + column * (column_width + MENU_COLUMN_GAP)
-            titles.append((title, (x + 4, y + 7)))
-            for row, (key, shortcut, text) in enumerate(items):
-                rect = ui.Rect(x, y + 32 + MENU_ROW_HEIGHT * row, column_width, MENU_ROW_HEIGHT - 1)
-                rows.append((key, f"[{shortcut}] {text}", rect))
-        y += 32 + MENU_ROW_HEIGHT * max(len(items) for _, items in band_groups) + 4
-    height = y - top + 12 + small_font.get_linesize() * len(hint)
-    # a window too short for the whole panel cuts it off (rows below stay unreachable)
-    panel = ui.Rect(left, top, width, max(1, min(height, HEIGHT - top - 4)))
-    rows = [row for row in rows if panel.contains(row[2])]
-    return panel, titles, rows, hint
+    def pack(row_height, title_height, title_offset):
+        heights = [0] * columns
+        titles, rows = [], []
+        for title, items in groups:
+            column = heights.index(min(heights))
+            x, y = left + MENU_PADDING + column * step, top + heights[column]
+            titles.append((title, (x + 4, y + title_offset)))
+            for row, (key, label) in enumerate(items):
+                rect = ui.Rect(x, y + title_height + row_height * row, column_width, row_height - 1)
+                rows.append((key, fit_text(label, small_font, column_width - 8), rect))
+            heights[column] += title_height + row_height * len(items) + 4
+        return max(heights), titles, rows
+
+    for spacing in MENU_SPACINGS:
+        content, titles, rows = pack(*spacing)
+        for hint in (full_hint, []):
+            height = content + 12 + small_font.get_linesize() * len(hint)
+            if height <= room:
+                return ui.Rect(left, top, width, height), titles, rows, hint
+    # still too short: the tightest spacing, cut off above the hint (rows below are unreachable)
+    panel = ui.Rect(left, top, width, max(1, room))
+    limit = panel.bottom - 8 - small_font.get_linesize() * len(full_hint)
+    rows = [row for row in rows if row[2].bottom <= limit]
+    titles = [title for title in titles if title[1][1] + font.get_linesize() <= limit]
+    return panel, titles, rows, full_hint
 
 
 def menu_key_at(pos):
@@ -2422,6 +2558,8 @@ def hud_texts(detected_period):
         if view == VIEW_SCOPE:
             help_text += f"   Time span: {scope_time_span()}"
     texts.append((small_font, help_text))
+    exclusive = "   WASAPI exclusive" if STREAM_OPEN_KWARGS.get("exclusive") else ""
+    texts.append((small_font, f"Audio buffer:{format_buffer()}{audio_latency_label()}{exclusive}"))
 
     if gl_renderer is not None:
         if trace_renderer == "CRT":
@@ -2521,6 +2659,7 @@ print("  Keys: [Tab]/[1]/[2]/[3] view  [S] spectrum overlay  [Q]/[Shift+Q] spect
 print("        [U]/[Shift+U] spectrum smoothing  [Y]/[Shift+Y] spectrum dB range / cepstrum zoom")
 print("        [F1] Menu  [F2] Level meter  [F3] Status text & menu button  [F4] Reset window size")
 print("        [F5] Max FPS (+Shift: back)  [F6] VSync")
+print("        [F8] Audio buffer Auto / FPS sync / 32..2048 (+Shift: back)  [F9] WASAPI exclusive mode (WASAPI inputs)")
 if sys.platform == 'darwin' and gl_renderer is not None:
     print("        [F7] Retina resolution")
 print("        [A] AGC Off/High/Med/Low (Scope & Lissajous)  [D] AGC dBFS labels  [H] AGC peak hold")
@@ -2566,6 +2705,13 @@ def handle_key(symbol, modifiers):
         set_vsync(not VSYNC)
     elif symbol == key.F7:
         set_retina(not RETINA)
+    elif symbol == key.F8:
+        step = -1 if modifiers & key.MOD_SHIFT else 1
+        options = AUDIO_BUFFER_OPTIONS
+        index = options.index(AUDIO_BUFFER) if AUDIO_BUFFER in options else 0
+        set_audio_options(options[(index + step) % len(options)], WASAPI_EXCLUSIVE)
+    elif symbol == key.F9 and device_supports_exclusive():
+        set_audio_options(AUDIO_BUFFER, not WASAPI_EXCLUSIVE)
     elif symbol == key.TAB:
         view = (view + 1) % len(VIEW_NAMES)
     elif symbol == key._1:
@@ -2665,6 +2811,7 @@ def handle_key(symbol, modifiers):
 
     if FPS != old_fps:
         schedule_frames()
+    sync_audio_buffer() # FPS / VSync changes resize an FPS-synced buffer
     save_settings_if_changed()
     return pyglet.event.EVENT_HANDLED
 
@@ -2846,7 +2993,7 @@ finally:
             stream.stop_stream()
     finally:
         stream.close()
-        pa.terminate()
+        terminate_audio()
         screen.delete()
         overlay.delete()
         waterfall.image.delete()

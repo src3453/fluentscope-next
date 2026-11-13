@@ -1,4 +1,6 @@
 numpy
 pyglet>=2.1.19,<3
-PyAudio; sys_platform != "win32"
+# Audio input (buffer size / latency control, WASAPI exclusive, WDM-KS)
+sounddevice>=0.5
+# Windows WASAPI output loopback
 PyAudioWPatch; sys_platform == "win32"

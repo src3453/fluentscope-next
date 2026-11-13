@@ -45,8 +45,7 @@ class PygletAppTests(unittest.TestCase):
 
         test = self
         original_run = pyglet.app.run
-        stream = Mock()
-        stream.is_active.return_value = True
+        streams = []
         capture_callback = None
         position = 0
 
@@ -58,11 +57,15 @@ class PygletAppTests(unittest.TestCase):
                                        0.55 * np.sin(t * 440 * 2 * np.pi + 0.7)))
             capture_callback((samples * 32767).astype(np.int16).tobytes(), len(t), None, 0)
 
-        def capture(pa, module, device, callback, *args):
+        def capture(audio, device, callback, buffer_frames=0, *args, **kwargs):
             nonlocal capture_callback
             capture_callback = callback
+            stream = Mock()
+            stream.is_active.return_value = True
             stream.start_stream.side_effect = feed
-            return stream, {'channels': 2, 'rate': 48000}
+            streams.append(stream)
+            return stream, {'channels': 2, 'rate': 48000, 'buffer_frames': buffer_frames,
+                            'latency': 0.005, 'exclusive': False}
 
         def exercise(*args, **kwargs):
             # Called directly from the running application's module namespace.
@@ -152,6 +155,31 @@ class PygletAppTests(unittest.TestCase):
             state['on_key_press'](key.F5, key.MOD_SHIFT)
             test.assertNotEqual(state['FPS'], old_fps)
 
+            # FPS sync: the largest power-of-two buffer within one frame, following F5.
+            state['set_vsync'](False)
+            state['FPS'] = 60
+            state['on_key_press'](key.F8, 0) # Auto -> FPS sync
+            test.assertEqual(state['AUDIO_BUFFER'], state['BUFFER_FPS_SYNC'])
+            test.assertEqual(state['STREAM_OPEN_KWARGS']['buffer_frames'], 512) # 800 / frame
+            reopened = len(streams)
+            state['on_key_press'](key.F5, 0) # 60 -> 120 FPS
+            test.assertEqual(state['STREAM_OPEN_KWARGS']['buffer_frames'], 256) # 400 / frame
+            test.assertEqual(len(streams), reopened + 1)
+            streams[-2].close.assert_called_once()
+            state['on_key_press'](key.J, 0) # unrelated keys keep the stream
+            state['on_key_press'](key.J, 0)
+            test.assertEqual(len(streams), reopened + 1)
+            state['on_key_press'](key.F8, 0) # FPS sync -> 32 frames
+            test.assertEqual(state['STREAM_OPEN_KWARGS']['buffer_frames'], 32)
+            state['on_key_press'](key.F8, key.MOD_SHIFT)
+            state['on_key_press'](key.F8, key.MOD_SHIFT)
+            test.assertEqual(state['AUDIO_BUFFER'], 0)
+            panel, titles, rows, hint = state['menu_layout']()
+            test.assertIn('System', [title for title, _ in titles])
+            for _, _, rect in rows: # no row runs outside its panel or into another
+                test.assertTrue(panel.contains(rect))
+            frame()
+
             window.set_size(800, 520)
             window.dispatch_events()
             frame()
@@ -227,20 +255,22 @@ class PygletAppTests(unittest.TestCase):
             (Path(temp) / 'fluentscope_settings.json').write_text(json.dumps({
                 'trace_renderer': 'Pygame', 'max_fps': 60, 'window_size': [1000, 600],
             }))
-            fake_audio = Mock(paInt16=8, paContinue=0)
-            modules = {'pyaudio': fake_audio, 'pyaudiowpatch': fake_audio}
+            audio_system = Mock()
+            modules = {}
             if not modern:
                 modules['moderngl'] = None
             with injected_modules(modules), \
+                    patch.object(audio_devices, 'AudioSystem', return_value=audio_system), \
                     patch.object(audio_devices, 'capture_devices', return_value=[device]), \
                     patch.object(audio_devices, 'resolve_device', return_value=device), \
                     patch.object(audio_devices, 'open_capture', side_effect=capture), \
                     patch.object(pyglet.app, 'run', new=exercise), \
                     patch.object(sys, 'argv', [str(target), '0']):
                 runpy.run_path(str(target))
-        stream.stop_stream.assert_called_once()
-        stream.close.assert_called_once()
-        fake_audio.PyAudio.return_value.terminate.assert_called_once()
+        streams[-1].stop_stream.assert_called_once()
+        for stream in streams:
+            stream.close.assert_called_once()
+        audio_system.terminate.assert_called_once()
 
     @unittest.skipUnless(importlib.util.find_spec('moderngl'), 'optional ModernGL is not installed')
     def test_all_views_renderers_retina_input_and_shutdown(self):

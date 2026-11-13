@@ -5,15 +5,141 @@ from pathlib import Path
 import subprocess
 import sys
 
+WASAPI_API = 'Windows WASAPI'
+BUFFER_SIZES = (0, 32, 64, 128, 256, 512, 1024, 2048)  # frames per callback; 0 = Auto
+LOOPBACK_BUFFER = 512  # PyAudio cannot request a latency, so Auto keeps the old block size
 
-def capture_devices(pa):
-    devices = []
-    for index in range(pa.get_device_count()):
-        info = dict(pa.get_device_info_by_index(index))
-        if info['maxInputChannels'] > 0:
-            info['index'] = index
-            info['api_name'] = pa.get_host_api_info_by_index(info['hostApi'])['name']
-            devices.append(info)
+
+def _clean_name(name):
+    # Kernel-streaming filter names can contain raw INF strings with line breaks.
+    return ' '.join(str(name).split())
+
+
+class SoundDeviceStream:
+    """PyAudio-style lifecycle (start/stop/is_active/close) over a sounddevice stream."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._closed = False
+
+    def start_stream(self):
+        self._stream.start()
+
+    def stop_stream(self):
+        if not self._closed:
+            self._stream.stop()
+
+    def is_active(self):
+        return not self._closed and self._stream.active
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._stream.close()
+
+
+class AudioSystem:
+    """Ordinary inputs open through sounddevice, which can request a buffer size and
+    latency, WASAPI exclusive mode and WDM-KS (PyAudio can do none of these).
+    PyAudioWPatch is kept only for Windows WASAPI output loopback."""
+
+    def __init__(self, sd=None, loopback_backend=None):
+        """``loopback_backend`` None imports PyAudioWPatch on Windows; False disables it."""
+        if sd is None:
+            import sounddevice as sd
+        if loopback_backend is None and sys.platform == 'win32':
+            try:
+                import pyaudiowpatch as loopback_backend
+            except ImportError:
+                loopback_backend = None
+        self.sd = sd
+        self.loopback_backend = loopback_backend
+        self.loopback_pa = loopback_backend.PyAudio() if loopback_backend else None
+
+    def _loopback_base(self):
+        # Loopback indices continue after sounddevice's so selectors stay unique.
+        return len(self.sd.query_devices())
+
+    def devices(self):
+        apis = [api['name'] for api in self.sd.query_hostapis()]
+        devices = []
+        for index, info in enumerate(self.sd.query_devices()):
+            if info['max_input_channels'] > 0:
+                devices.append(dict(
+                    index=index, sd_index=index, name=_clean_name(info['name']),
+                    maxInputChannels=int(info['max_input_channels']),
+                    defaultSampleRate=float(info['default_samplerate']),
+                    api_name=apis[info['hostapi']], isLoopbackDevice=False,
+                    capture_backend='sounddevice'))
+        pa = self.loopback_pa
+        if pa is not None:
+            base = self._loopback_base()
+            for index in range(pa.get_device_count()):
+                info = pa.get_device_info_by_index(index)
+                if info.get('isLoopbackDevice') and info['maxInputChannels'] > 0:
+                    devices.append(dict(
+                        index=base + index, pa_index=index, name=_clean_name(info['name']),
+                        maxInputChannels=int(info['maxInputChannels']),
+                        defaultSampleRate=float(info['defaultSampleRate']),
+                        api_name=pa.get_host_api_info_by_index(info['hostApi'])['name'],
+                        isLoopbackDevice=True, capture_backend='pyaudio'))
+        return devices
+
+    def get_default_input_device_info(self):
+        index = self.sd.default.device[0]
+        if index is None or int(index) < 0:
+            raise LookupError('No default input device.')
+        return dict(index=int(index))
+
+    def get_default_wasapi_loopback(self):
+        if self.loopback_pa is None:
+            raise ValueError('Native loopback requires macOS 13+ or PyAudioWPatch on Windows. '
+                             'Otherwise select a monitor/virtual input by name or index.')
+        info = self.loopback_pa.get_default_wasapi_loopback()
+        return dict(index=self._loopback_base() + int(info['index']))
+
+    def open_input(self, device, callback, buffer_frames, channels, rates, exclusive):
+        sd = self.sd
+        exclusive = bool(exclusive) and device.get('api_name') == WASAPI_API
+        extra = sd.WasapiSettings(exclusive=True) if exclusive else None
+
+        def deliver(indata, frames, time_info, status):
+            callback(indata, frames, time_info, status)
+
+        last_error = None
+        for rate in rates:
+            try:
+                stream = sd.RawInputStream(
+                    device=int(device['sd_index']), channels=channels, samplerate=rate,
+                    dtype='int16', blocksize=buffer_frames,
+                    latency=buffer_frames / rate if buffer_frames else 'low',
+                    extra_settings=extra, callback=deliver)
+            except (sd.PortAudioError, ValueError) as exc:
+                last_error = OSError(str(exc))
+                continue
+            return SoundDeviceStream(stream), dict(
+                channels=channels, rate=rate, buffer_frames=buffer_frames,
+                latency=float(stream.latency), exclusive=exclusive)
+        raise last_error
+
+    def open_loopback(self, device, callback, buffer_frames, channels, rate):
+        kwargs = dict(format=self.loopback_backend.paInt16, channels=channels, rate=rate,
+                      input=True, frames_per_buffer=buffer_frames or LOOPBACK_BUFFER,
+                      input_device_index=int(device['pa_index']), stream_callback=callback,
+                      start=False)
+        stream = self.loopback_pa.open(**kwargs)
+        latency = stream.get_input_latency()
+        return stream, dict(kwargs, buffer_frames=buffer_frames, exclusive=False,
+                            latency=latency if isinstance(latency, (int, float)) else None)
+
+    def terminate(self):
+        if self.loopback_pa is not None:
+            self.loopback_pa.terminate()
+            self.loopback_pa = None
+
+
+def capture_devices(audio):
+    devices = audio.devices()
     if sys.platform == 'darwin':
         from macos_loopback import system_audio_device
         devices.append(system_audio_device())
@@ -80,29 +206,26 @@ def print_devices(devices):
         print(f"{device['index']:3}: [{kind} / {device['api_name']}] {name}{selector}")
 
 
-def open_capture(pa, backend, device, callback, chunk, preferred_rate=48000,
-                 preferred_channels=2):
-    """Use the endpoint's native format for WASAPI loopback, including surround."""
+def open_capture(audio, device, callback, buffer_frames=0, preferred_rate=48000,
+                 preferred_channels=2, exclusive=False):
+    """Open ``device`` stopped; returns (stream, format dict).
+
+    Loopback uses the endpoint's native format, including surround. Ordinary inputs
+    use up to two channels at the preferred rate, falling back to the native rate.
+    ``buffer_frames`` 0 (Auto) lets PortAudio pick the block size at its lowest latency.
+    ``exclusive`` applies to WASAPI inputs only.
+    """
     if device.get('capture_backend') == 'screencapturekit':
         from macos_loopback import MacOSLoopbackStream
-        return MacOSLoopbackStream(callback, chunk), dict(channels=2, rate=48000)
+        return MacOSLoopbackStream(callback, buffer_frames or LOOPBACK_BUFFER), dict(
+            channels=2, rate=48000, buffer_frames=buffer_frames, exclusive=False, latency=None)
     channels = int(device['maxInputChannels'])
-    if not device.get('isLoopbackDevice'):
-        channels = min(preferred_channels, 2, channels)
     native_rate = int(device['defaultSampleRate'])
-    rates = [native_rate] if device.get('isLoopbackDevice') else list(dict.fromkeys(
-        [preferred_rate, native_rate]))
-    last_error = None
-    for rate in rates:
-        kwargs = dict(format=backend.paInt16, channels=channels, rate=rate,
-                      input=True, frames_per_buffer=chunk,
-                      input_device_index=int(device['index']), stream_callback=callback,
-                      start=False)
-        try:
-            return pa.open(**kwargs), kwargs
-        except (OSError, ValueError) as exc:
-            last_error = exc
-    raise last_error
+    if device.get('isLoopbackDevice'):
+        return audio.open_loopback(device, callback, buffer_frames, channels, native_rate)
+    channels = min(preferred_channels, 2, channels)
+    rates = list(dict.fromkeys([preferred_rate, native_rate]))
+    return audio.open_input(device, callback, buffer_frames, channels, rates, exclusive)
 
 
 def choose_device(pa, devices, open_device):

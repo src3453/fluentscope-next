@@ -40,7 +40,7 @@ py -3.12 -m venv .venv
 
 Without a device argument, the last command opens a startup menu. Select **Input** for a microphone or line input, or **Output loopback** to capture audio playing through a Windows output device, then click **Start** (or double-click the device). Capture errors are shown in the menu so you can try another device. Cancel or Escape exits.
 
-Windows uses [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI output loopback; no Stereo Mix device or virtual audio cable is required. macOS 13+ uses Apple's ScreenCaptureKit for driver-free system audio capture (see below). On Linux, select an OS-provided monitor or virtual input under **Input** for output capture. The startup menu requires Tkinter (included with standard Python on Windows; often packaged as `python3-tk` on Linux).
+Windows uses [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) for WASAPI output loopback; no Stereo Mix device or virtual audio cable is required. Inputs are opened with [python-sounddevice](https://python-sounddevice.readthedocs.io/), which can request a buffer size and latency (PyAudio cannot) and, on Windows, offers WASAPI exclusive mode and Kernel Streaming (**Windows WDM-KS** in the API column). See [Low-latency input](#low-latency-input). macOS 13+ uses Apple's ScreenCaptureKit for driver-free system audio capture (see below). On Linux, select an OS-provided monitor or virtual input under **Input** for output capture. The startup menu requires Tkinter (included with standard Python on Windows; often packaged as `python3-tk` on Linux).
 
 To update an existing environment, rerun `python -m pip install -r requirements.txt`. You can still select a device directly from the command line. Replace `0` with your device index from `--list-devices`.
 
@@ -50,7 +50,20 @@ To update an existing environment, rerun `python -m pip install -r requirements.
 .\.venv\Scripts\python.exe fluentscope_next.py --loopback
 ```
 
-`--loopback` captures the default Windows WASAPI output, or system audio on macOS 13+. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. If several capture devices have that exact name, startup stops with a warning and lists selectors such as `"exact:Device Name:1"` and `"exact:Device Name:2"`. The final number is the 1-based occurrence among devices with the same name, in `--list-devices` order (across audio APIs); duplicate entries in that list also show their numbered selectors. Names containing colons are supported; a matching full device name takes precedence over interpreting its final colon as an occurrence suffix. Device indices and occurrence order depend on the audio backend and connected devices; check the list again after upgrading. Windows loopback uses the output device's native sample rate and channel count; the first two channels are displayed. macOS system audio uses stereo at 48 kHz. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. If PyAudio needs to build from source, install the PortAudio development headers for your platform first.
+`--loopback` captures the default Windows WASAPI output, or system audio on macOS 13+. You can also pass a unique substring of a capture device name or use `"exact:Device Name"` to match the full name. If several capture devices have that exact name, startup stops with a warning and lists selectors such as `"exact:Device Name:1"` and `"exact:Device Name:2"`. The final number is the 1-based occurrence among devices with the same name, in `--list-devices` order (across audio APIs); duplicate entries in that list also show their numbered selectors. Names containing colons are supported; a matching full device name takes precedence over interpreting its final colon as an occurrence suffix. Device indices and occurrence order depend on the audio backend and connected devices; check the list again after upgrading. Windows loopback uses the output device's native sample rate and channel count; the first two channels are displayed. macOS system audio uses stereo at 48 kHz. Ordinary inputs use up to two channels at 48 kHz, with the native sample rate as a fallback. On Linux, sounddevice needs the PortAudio library from your distribution (for example `libportaudio2`).
+
+### Low-latency input
+
+The buffer size (F8) and WASAPI exclusive mode (F9) are in the menu's **System** group and are saved in `fluentscope_settings.json` (`audio_buffer`, `wasapi_exclusive`). The status text shows the buffer and the input latency PortAudio reports for the open stream. **Auto** asks PortAudio for its lowest latency and lets it choose the block size. **FPS sync** follows the display: it uses the largest power-of-two buffer (32–2048 frames) that fits in one frame at the Max FPS setting, or at the monitor's refresh rate with VSync on or an unlimited frame rate, so every drawn frame receives new audio without smaller callbacks than the display can use (48 kHz at 60 FPS: 512 frames; at 180 FPS: 256). It reopens the stream when F5 or F6 changes the frame rate. A fixed size requests that many frames per callback and a matching latency. Changing either setting reopens the stream; if the device rejects it, the previous setting is restored.
+
+Which API gives the lowest latency depends on the driver, not only on the API:
+
+- **WASAPI shared mode** (the default for WASAPI inputs) goes through the Windows audio engine, typically about 20 ms whatever the buffer size.
+- **WASAPI exclusive mode** bypasses the engine and takes the device for FluentScope alone (other apps cannot use it meanwhile). It is usually the best choice for USB audio interfaces: around 3 ms with a 64-frame buffer. If exclusive mode cannot be opened, shared mode is used and the menu shows "On (shared in use)".
+- **WDM-KS** also bypasses the engine. Devices with their own kernel drivers (and virtual devices such as Voicemeeter) can reach 1–2 ms, but devices on the standard Windows USB audio driver stop at about 10 ms. WDM-KS usually opens the device exclusively too, so close other apps using that input if it fails to open.
+- **MME** and **DirectSound** have high latency; use them only for compatibility.
+
+Very small buffers raise CPU load and can cause dropouts. Output loopback still uses PyAudioWPatch, which cannot request a latency; the buffer setting only changes its block size there.
 
 ### macOS
 
@@ -98,6 +111,8 @@ FLUENTSCOPE_NATIVE_TESTS=1 .venv/bin/python -m unittest discover -s tests -v
 | F4 | Reset the window to its default size (1000x600) |
 | F5 / Shift+F5 | Cycle the maximum frame rate: 30, 60, 120, 144, 180, 240, Unlimited (ignored while VSync is on) |
 | F6 | Toggle VSync |
+| F8 / Shift+F8 | Cycle the audio buffer size: Auto, FPS sync, 32, 64, 128, 256, 512, 1024, 2048 frames (reopens the stream) |
+| F9 | Toggle WASAPI exclusive mode (shown for WASAPI inputs only) |
 | F7 | Toggle Retina plot resolution (macOS, with ModernGL) |
 | Tab or 1–3 | Cycle or select Scope, Spectrum, and Lissajous |
 | S | Toggle the spectrum overlay |
@@ -136,7 +151,7 @@ Copyright © 2026 src3453. FluentScope Next is distributed under the [MIT Licens
 | Python | [Python Software Foundation License](https://docs.python.org/3/license.html) |
 | NumPy | [BSD 3-Clause and bundled component notices](https://numpy.org/doc/stable/license.html) |
 | pyglet | [BSD 3-Clause](https://github.com/pyglet/pyglet/blob/master/LICENSE) |
-| PyAudio | [MIT](https://pypi.org/project/PyAudio/) |
+| python-sounddevice | [MIT](https://github.com/spatialaudio/python-sounddevice/blob/master/LICENSE) |
 | PyAudioWPatch (Windows) | [MIT](https://github.com/s0d3s/PyAudioWPatch/blob/master/LICENSE.txt) |
 | PortAudio | [MIT](https://github.com/PortAudio/portaudio/blob/master/LICENSE.txt) |
 | ModernGL (optional) | [MIT](https://github.com/moderngl/moderngl/blob/main/LICENSE) |

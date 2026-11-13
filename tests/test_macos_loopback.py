@@ -8,23 +8,24 @@ from macos_loopback import MacOSLoopbackStream, system_audio_device
 
 class MacOSDiscoveryTests(unittest.TestCase):
     def test_native_loopback_without_portaudio_devices(self):
-        pa = Mock()
-        pa.get_device_count.return_value = 0
+        audio = Mock()
+        audio.devices.return_value = []
         with patch('audio_devices.sys.platform', 'darwin'):
-            devices = capture_devices(pa)
+            devices = capture_devices(audio)
         self.assertEqual(devices, [system_audio_device()])
-        self.assertEqual(resolve_device(pa, devices, '--loopback'), devices[0])
-        self.assertEqual(resolve_device(pa, devices, 'macOS System Audio'), devices[0])
-        pa.get_default_wasapi_loopback.assert_not_called()
+        self.assertEqual(resolve_device(audio, devices, '--loopback'), devices[0])
+        self.assertEqual(resolve_device(audio, devices, 'macOS System Audio'), devices[0])
+        audio.get_default_wasapi_loopback.assert_not_called()
 
     def test_native_open_does_not_call_portaudio(self):
-        pa, callback = Mock(), Mock()
+        audio, callback = Mock(), Mock()
         with patch('macos_loopback.MacOSLoopbackStream') as stream:
-            opened, config = open_capture(pa, object(), system_audio_device(), callback, 512)
+            opened, config = open_capture(audio, system_audio_device(), callback, 0)
         stream.assert_called_once_with(callback, 512)
         self.assertIs(opened, stream.return_value)
-        self.assertEqual(config, dict(channels=2, rate=48000))
-        pa.open.assert_not_called()
+        self.assertEqual((config['channels'], config['rate']), (2, 48000))
+        audio.open_input.assert_not_called()
+        audio.open_loopback.assert_not_called()
 
 
 class MacOSStreamTests(unittest.TestCase):
